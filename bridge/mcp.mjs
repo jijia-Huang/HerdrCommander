@@ -45,7 +45,7 @@ async function handle(request) {
     return {
       protocolVersion: params?.protocolVersion ?? '2025-06-18',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'herdr-bridge', version: '0.1.0' },
+      serverInfo: { name: 'herdr-bridge', version: '0.2.1' },
       instructions: `herdr-bridge for pane ${ctx.from || '?'} (${ctx.role}). Jobs are complete only when herdr_job_get says completed.`,
     }
   }

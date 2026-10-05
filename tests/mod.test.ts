@@ -94,8 +94,25 @@ describe('inside herdr', () => {
     const env = (await $.prompt.compose(COMPOSE_INPUT)).sections.find(section => section.id === 'herdr-commander:env')
     expect(env?.text).toContain('WORKER')
     expect(env?.text).toContain('SendMessage to "main"')
+    expect(env?.text).toContain('given to you directly')
     expect(env?.text).not.toContain('herdr_job_complete')
   })
+
+  for (const [role, expected] of [['worker', [1, 1]], ['plain', [1, 0]]] as const) {
+    test(`the herdr text rides on prompts as context (${role}): every prompt of a worker, once for another role`, async ($, on) => {
+      const seen: number[] = []
+      worldOf(on, role === 'worker' ? { ...HERDR_ENV, HERDR_COMMANDER_ROLE: 'worker' } : HERDR_ENV)
+      mock.clock(on)
+      on('prompt.submit', ($, e) => {
+        seen.push((e.context ?? []).filter(text => text.includes('herdr-commander:')).length)
+        return { text: e.text } as never
+      })
+      await $.session.start(SESSION)
+      await $.prompt.submit({ text: 'Fix the bug in a.lua.' } as never)
+      await $.prompt.submit({ text: 'Also the README.' } as never)
+      expect(seen).toEqual([...expected])
+    })
+  }
 
   test('/commander claims the lease, opens the pane, adds the role section and blocks edits; off undoes it', async ($, on) => {
     const world = worldOf(on, HERDR_ENV)
@@ -258,7 +275,7 @@ describe('Agent, SendMessage, TaskStop through herdr', () => {
   test('ListAgents keeps the native listing and adds the herdr workers and other panes with their files', async ($, on) => {
     const world = worldOf(on, HERDR_ENV)
     mock.clock(on)
-    world.replies.snapshot = { agents: AGENTS, lease: null, jobs: [], bg: [], workers: [{ ...WORKER, pane_id: 'wA:p2', status: 'running', job: 'job-1', queued: 1 }], panes_dir: 'C:/rt/wA/panes' }
+    world.replies.snapshot = { agents: AGENTS, lease: null, jobs: [], workers: [{ ...WORKER, pane_id: 'wA:p2', status: 'running', job: 'job-1', queued: 1 }], panes_dir: 'C:/rt/wA/panes' }
     on('tool.call', () => ({ result: { listing: 'Peer sessions (0)' } }) as never)
     await $.session.start(SESSION)
     const ran = await $.tool.call({ tool: 'ListAgents' } as never)
@@ -287,38 +304,16 @@ describe('Read, background commands and turns', () => {
     expect(world.bridge.filter(call => call.command === 'refresh').length).toBe(1)
   })
 
-  test('background Bash goes to a herdr pane only when the permission chain allows it', async ($, on) => {
-    const world = worldOf(on, HERDR_ENV)
-    mock.clock(on)
-    let decision: 'allow' | 'ask' | 'deny' = 'allow'
-    on('tool.check', () => ({ decision, reason: 'rule' }))
-    on('tool.call', () => NATIVE as never)
-    world.replies['bg-run'] = { bg: { id: 'herdr-bg-wA-0a0b0c', pane_id: 'wA:p8', output_file: 'C:/rt/wA/bg/herdr-bg-wA-0a0b0c.log' } }
-    await $.session.start(SESSION)
-
-    const ran = await $.tool.call(CALLS.bash as never)
-    expect(ran.result).toEqual({ stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'herdr-bg-wA-0a0b0c' })
-    expect((ran.context ?? []).join('\n')).toContain('C:/rt/wA/bg/herdr-bg-wA-0a0b0c.log')
-    expect(world.bridge.find(call => call.command === 'bg-run')?.args).toEqual({ command: 'npm test', shell: 'bash', description: 'tests', cwd: 'D:\\work' })
-    decision = 'ask'
-    expect((await $.tool.call(CALLS.bash as never)).result).toBe('native')
-    decision = 'deny'
-    expect((await $.tool.call(CALLS.bash as never)).deny).toBe('rule')
-    expect((await $.tool.call({ ...CALLS.bash, run_in_background: false } as never)).result).toBe('native')
-    expect(world.bridge.filter(call => call.command === 'bg-run').length).toBe(1)
-  })
-
-  test('a Monitor command becomes a herdr monitor; its WebSocket form stays native', async ($, on) => {
+  test('background Bash and PowerShell, and Monitor, are always Claude\'s own, even with herdr allowed', async ($, on) => {
     const world = worldOf(on, HERDR_ENV)
     mock.clock(on)
     on('tool.check', () => ({ decision: 'allow' as const }))
     on('tool.call', () => NATIVE as never)
-    world.replies['bg-run'] = { bg: { id: 'herdr-mon-wA-0a0b0c', pane_id: 'wA:p8', output_file: 'C:/rt/wA/bg/herdr-mon-wA-0a0b0c.log' } }
     await $.session.start(SESSION)
-    const ran = await $.tool.call({ tool: 'Monitor', description: 'watch log', timeout_ms: 60000, command: 'tail -f a.log' } as never)
-    expect(ran.result).toEqual({ taskId: 'herdr-mon-wA-0a0b0c', timeoutMs: 60000 })
-    expect(world.bridge.find(call => call.command === 'bg-run')?.args).toMatchObject({ shell: 'bash', monitor: true, timeout_ms: 60000 })
-    expect((await $.tool.call({ tool: 'Monitor', description: 'ws', timeout_ms: 1000, ws: { url: 'ws://x' } } as never)).result).toBe('native')
+    expect((await $.tool.call(CALLS.bash as never)).result).toBe('native')
+    expect((await $.tool.call({ tool: 'PowerShell', command: 'npm test', run_in_background: true } as never)).result).toBe('native')
+    expect((await $.tool.call({ tool: 'Monitor', description: 'watch log', timeout_ms: 60000, command: 'tail -f a.log' } as never)).result).toBe('native')
+    expect(world.bridge.some(call => !['report-session', 'report'].includes(call.command))).toBe(false)
   })
 
   test('the end of a main-loop turn is reported to the bridge (it decides about jobs)', async ($, on) => {
@@ -370,7 +365,7 @@ describe('pure helpers', () => {
     expect(transitions(before, after, 'wA:p1').map(one => [one.row.paneId, one.isBlocked])).toEqual([['wA:p2', true], ['wD:p2', false]])
   })
 
-  test('job events wake once each: a worker message whole, then completed; ended background commands', () => {
+  test('job events wake once each: a worker message whole, then completed', () => {
     const worker: WorkerRow = { herdrId: 'herdr-agent-wA-abc123', kind: 'claude', name: 'impl', agentName: null, paneId: 'wA:p9', status: 'running', cwd: 'D:\\w', outputFile: 'C:/rt/out.md', note: '', jobId: 'job-1', queued: 0 }
     const job: JobRow = {
       jobId: 'job-1', from: 'wA:p1', to: 'wA:p9', worker: worker.herdrId, kind: 'task', status: 'completed', summary: 'done', body: 'x', resultPath: 'r.md',
@@ -378,13 +373,11 @@ describe('pure helpers', () => {
       events: [{ seq: 1, type: 'stopped_without_message', at: 't' }, { seq: 3, type: 'message', at: 't', message_seq: 2 }, { seq: 4, type: 'completed', at: 't', via: 'message' }],
     }
     const theirs: JobRow = { ...job, jobId: 'job-2', from: 'wA:p5' }
-    const bg = [{ id: 'herdr-bg-wA-1', paneId: 'wA:p8', command: 'npm test', status: 'exited', exitCode: 1, outputFile: 'C:/rt/bg.log', monitor: false, description: '', newLines: [] }]
-    const first = notices('wA:p1', [job, theirs], bg, [worker], [])
-    expect(first.keys).toEqual(['job-1#1', 'job-1#3', 'job-1#4', 'herdr-bg-wA-1#end'])
+    const first = notices('wA:p1', [job, theirs], [worker], [])
+    expect(first.keys).toEqual(['job-1#1', 'job-1#3', 'job-1#4'])
     expect(first.lines[1]).toContain('Result: all 3 tests pass')
     expect(first.lines[2]).toContain('SendMessage to herdr-agent-wA-abc123 continues the same job')
-    expect(first.lines[3]).toContain('exited with code 1')
-    expect(notices('wA:p1', [job], bg, [worker], first.keys)).toEqual({ keys: [], lines: [] })
+    expect(notices('wA:p1', [job], [worker], first.keys)).toEqual({ keys: [], lines: [] })
   })
 
   test('the herdr listing says when there is nothing', () => {

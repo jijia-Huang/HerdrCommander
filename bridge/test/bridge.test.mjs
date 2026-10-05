@@ -101,14 +101,16 @@ test('the task file starts with a UTF-8 BOM so PowerShell 5.1 reads non-ASCII te
   assert.match(bytes.subarray(3).toString('utf8'), /^# herdr job .*列出檔案行數/s)
 })
 
-test('a codex target that stays idle after the prompt gets one Enter; a claude target does not', async () => {
+test('a codex or claude target that stays idle after the prompt gets one Enter; one that starts working does not', async () => {
   const { job } = await ops.send(me, { target: 'wA:p2', body: 'x' })
   assert.equal(job.nudged, true)
   assert.equal(calls().filter(args => args[0] === 'agent' && args[1] === 'send-keys' && args[3] === 'enter').length, 1)
   writeFileSync(logPath, '')
   arrange({ agents: AGENTS.map(one => (one.pane_id === 'wA:p3' ? { ...one, agent: 'claude' } : one)) })
-  const second = await ops.send(me, { target: 'wA:p3', body: 'x' })
-  assert.equal(second.job.nudged, false)
+  assert.equal((await ops.send(me, { target: 'wA:p3', body: 'x' })).job.nudged, true)
+  writeFileSync(logPath, '')
+  arrange({ agents: AGENTS.map(one => (one.pane_id === 'wA:p3' ? { ...one, agent: 'claude', agent_status: 'working' } : one)) })
+  assert.equal((await ops.send(me, { target: 'wA:p3', body: 'y' })).job.nudged, false)
   assert.equal(calls().some(args => args[1] === 'send-keys'), false)
 })
 
@@ -241,7 +243,6 @@ test('snapshot returns agents, lease, my jobs and reconciles them', async () => 
   const snap = await ops.snapshot(me)
   assert.equal(snap.agents.length, 3)
   assert.equal(snap.jobs[0].status, 'completed')
-  assert.deepEqual(snap.bg, [])
 })
 
 test('spawn opens a worker pane with the worker role and starts the agent', async () => {
@@ -351,11 +352,12 @@ const worker = { from: 'wA:p2', workspace: 'wA', role: 'worker', byUser: false }
 const other = { from: 'wA:p3', workspace: 'wA', role: 'plain', byUser: false }
 const prompts = to => calls().filter(args => args[0] === 'agent' && args[1] === 'prompt' && args[2] === to)
 
-test('a claude worker is told to answer with SendMessage to main; a codex worker keeps herdr_job_complete', async () => {
+test('a claude pane that is not a worker gets the one-line note: answer with SendMessage to main; a codex worker keeps herdr_job_complete', async () => {
   claudeWorker()
   const { job } = await ops.message(me, { to: 'wA:p2', text: 'list the files' })
+  assert.equal(job.delivered_as, 'file')
   assert.match(readFileSync(job.task_path, 'utf8'), /SendMessage tool to "main"/)
-  assert.match(prompts('wA:p2')[0][3], /SendMessage to "main"/)
+  assert.match(prompts('wA:p2')[0][3], /^\[herdr-job .*SendMessage to "main"/)
   assert.doesNotMatch(prompts('wA:p2')[0][3], /herdr_job_complete/)
   arrange()
   const codex = await ops.message(me, { to: 'wA:p3', text: 'x' })
@@ -506,39 +508,6 @@ test('TaskStop ends a worker it started: Ctrl+C, pane closed, open job stopped, 
   assert.deepEqual(await ops.stop(me, { target: 'herdr-agent-wA-000000' }), { matched: false })
 })
 
-test('a background command runs from script files and ends by its exit file', async () => {
-  arrange({ nextPane: 'wA:p8' })
-  const { bg } = await ops.bgRun(me, { command: 'echo "it\'s" && exit 3', shell: 'bash' })
-  assert.match(bg.id, /^herdr-bg-wA-[0-9a-f]{6}$/)
-  const run = calls().find(args => args[0] === 'pane' && args[1] === 'run')
-  assert.match(run[3], /^& '.+' '.+\.run\.sh'$/)
-  const runner = readFileSync(run[3].match(/'([^']+\.run\.sh)'$/)[1], 'utf8')
-  assert.match(runner, /PIPESTATUS\[0\]/)
-  assert.match(runner, /tee -a/)
-  assert.equal((await ops.bgStatus(me, { id: bg.id })).bg.status, 'running')
-  writeFileSync(bg.exit_path, '3\n')
-  const status = (await ops.bgStatus(me, { id: bg.id })).bg
-  assert.deepEqual([status.status, status.exit_code], ['exited', 3])
-  const ps = await ops.bgRun(me, { command: 'Write-Output "q"', shell: 'powershell' })
-  const line = calls().filter(args => args[0] === 'pane' && args[1] === 'run').at(-1)[3]
-  assert.match(line, /^powershell\.exe -NoLogo -NoProfile -EncodedCommand [A-Za-z0-9+/=]+$/)
-  assert.match(Buffer.from(line.split(' ').at(-1), 'base64').toString('utf16le'), /WriteAllText\('.+\.exit'/)
-  assert.equal(readFileSync(ps.bg.output_file, 'utf8'), '')
-})
-
-test('a monitor reports each new complete line once and stops at its deadline', async () => {
-  arrange({ nextPane: 'wA:p8' })
-  const { bg } = await ops.bgRun(me, { command: 'tail -f x', shell: 'bash', monitor: true, timeout_ms: 60000 })
-  assert.match(bg.id, /^herdr-mon-/)
-  writeFileSync(bg.output_file, 'one\ntwo\npart')
-  assert.deepEqual((await ops.bgStatus(me, { id: bg.id })).new_lines, ['one', 'two'])
-  writeFileSync(bg.output_file, 'one\ntwo\npartial done\n')
-  assert.deepEqual((await ops.bgStatus(me, { id: bg.id })).new_lines, ['partial done'])
-  const store = new Store('wA')
-  store.putBg({ ...store.getBg(bg.id), deadline: new Date(Date.now() - 1).toISOString() })
-  assert.equal((await ops.bgStatus(me, { id: bg.id })).bg.status, 'timeout')
-})
-
 test('reading a runtime file refreshes it: a worker output gets its screen, a pane file is written', async () => {
   claudeWorker()
   const store = new Store('wA')
@@ -584,4 +553,42 @@ test('a job is finished once even if two callers finish it', async () => {
   writeFileSync(stale.result_path, `job_id: ${job.job_id}\n\nanswer\n`)
   const out = await ops.jobGet(me, { job_id: job.job_id })
   assert.equal(out.job.events.filter(one => one.type === 'completed').length, 1)
+})
+
+test('a claude worker the bridge started gets the task and later messages as they are, multi-line included', async () => {
+  claudeWorker()
+  new Store('wA').addOwned({ pane_id: 'wA:p2', owner: 'wA:p1', kind: 'claude', name: 'w' })
+  const task = 'Fix the bug in a.lua.\n\nThen run the tests.'
+  const { job } = await ops.message(me, { to: 'wA:p2', text: task })
+  assert.equal(job.delivered_as, 'text')
+  assert.equal(prompts('wA:p2')[0][3], task)
+  await ops.message(me, { to: 'wA:p2', text: 'Also update the README.' })
+  assert.equal(prompts('wA:p2')[1][3], 'Also update the README.')
+  // Completion still comes from the records: a message to main, then the end of the turn.
+  await ops.reply(worker, { to: 'main', text: 'done' })
+  assert.equal((await ops.turnEnd(worker, {})).job.status, 'completed')
+})
+
+test('a message too long or unsafe to type goes by a file and a one-line note', async () => {
+  claudeWorker()
+  new Store('wA').addOwned({ pane_id: 'wA:p2', owner: 'wA:p1', kind: 'claude', name: 'w' })
+  const long = 'x'.repeat(ops.DIRECT_LIMIT + 1)
+  const { job } = await ops.message(me, { to: 'wA:p2', text: long })
+  assert.equal(job.delivered_as, 'file')
+  assert.match(prompts('wA:p2')[0][3], /^\[herdr-job .* -- Full task: .*\.md/)
+  assert.match(readFileSync(job.task_path, 'utf8'), /x{100}/)
+  await ops.message(me, { to: 'wA:p2', text: '/clear the cache first' })
+  assert.match(prompts('wA:p2')[1][3], /^\[herdr-job .*more from wA:p1 on this same job/)
+})
+
+test('what can be typed straight into a pane', () => {
+  assert.equal(ops.directText('line one\r\nline two'), 'line one\nline two')
+  assert.equal(ops.directText('中文任務：修正\t錯誤'), '中文任務：修正\t錯誤')
+  assert.equal(ops.directText('x'.repeat(ops.DIRECT_LIMIT)), 'x'.repeat(ops.DIRECT_LIMIT))
+  assert.equal(ops.directText('x'.repeat(ops.DIRECT_LIMIT + 1)), null)
+  assert.equal(ops.directText('a\u001b[2Jb'), null)
+  assert.equal(ops.directText('  /compact'), null)
+  assert.equal(ops.directText('!rm -rf x'), null)
+  assert.equal(ops.directText('# note'), null)
+  assert.equal(ops.directText('   '), null)
 })

@@ -2,12 +2,12 @@
 // The engine follows $ only within one file, so every $ call is in register.tsx.
 import type { PluginOptions } from 'claude-code'
 
-import type { AgentRow, AgentStatus, BgRow, Gate, JobEvent, JobRow, Role, WorkerRow } from '../types'
+import type { AgentRow, AgentStatus, Gate, JobEvent, JobRow, Role, WorkerRow } from '../types'
 
 // Options ----------------------------------------------------------------------
 
 export type Options = {
-  /** Inside herdr, Claude's own Agent / SendMessage / TaskStop / ListAgents / background tools / Monitor / Read go through herdr. */
+  /** Inside herdr, Claude's own Agent (herdr worker types) / SendMessage / TaskStop / ListAgents / Read go through herdr. */
   takeover: boolean
   lifecycleReport: boolean
   notifications: boolean
@@ -144,18 +144,6 @@ export type RawJob = {
   events?: JobEvent[]
 }
 
-export type RawBg = {
-  id: string
-  pane_id: string
-  command: string
-  status: string
-  exit_code?: number | null
-  output_file?: string
-  monitor?: boolean
-  description?: string | null
-  new_lines?: string[]
-}
-
 export type RawWorker = {
   herdr_id: string
   worker_kind: string
@@ -170,7 +158,7 @@ export type RawWorker = {
   queued: number
 }
 
-export type Snapshot = { agents: RawAgent[]; lease: { pane_id: string } | null; jobs: RawJob[]; bg: RawBg[]; workers?: RawWorker[]; panes_dir?: string }
+export type Snapshot = { agents: RawAgent[]; lease: { pane_id: string } | null; jobs: RawJob[]; workers?: RawWorker[]; panes_dir?: string }
 
 const STATUSES: readonly AgentStatus[] = ['working', 'idle', 'done', 'blocked', 'unknown']
 
@@ -213,20 +201,6 @@ export function toJobs(raw: readonly RawJob[]): JobRow[] {
     resultPath: job.result_path,
     messages: (job.messages ?? []).map(one => ({ seq: one.seq, from: one.from, text: one.text })),
     events: job.events ?? [],
-  }))
-}
-
-export function toBg(raw: readonly RawBg[]): BgRow[] {
-  return raw.map(one => ({
-    id: one.id,
-    paneId: one.pane_id,
-    command: one.command,
-    status: one.status,
-    exitCode: one.exit_code ?? null,
-    outputFile: one.output_file ?? '',
-    monitor: one.monitor === true,
-    description: one.description ?? '',
-    newLines: one.new_lines ?? [],
   }))
 }
 
@@ -276,9 +250,9 @@ const MESSAGE_ROOM = 6000
 
 /**
  * What this pane is told about the work it sent out and has not been told
- * yet: job events (keyed job#seq), ended background commands, monitor lines.
+ * yet: job events, keyed job#seq.
  */
-export function notices(self: string, jobs: readonly JobRow[], bg: readonly BgRow[], workers: readonly WorkerRow[], seen: readonly string[]): { keys: string[]; lines: string[] } {
+export function notices(self: string, jobs: readonly JobRow[], workers: readonly WorkerRow[], seen: readonly string[]): { keys: string[]; lines: string[] } {
   const keys: string[] = []
   const lines: string[] = []
   for (const job of jobs) {
@@ -313,17 +287,6 @@ export function notices(self: string, jobs: readonly JobRow[], bg: readonly BgRo
       } else if (event.type === 'start_blocked') {
         lines.push(`${label} is waiting on a prompt in its pane (folder trust, login, …); the person has to answer it there. Job ${job.jobId} goes out once the worker is idle.`)
       }
-    }
-  }
-  for (const one of bg) {
-    if (one.newLines.length > 0) {
-      lines.push(`Monitor ${one.id}${one.description ? ` (${one.description})` : ''}:\n${one.newLines.join('\n')}`)
-    }
-    const key = `${one.id}#end`
-    if (one.status !== 'running' && !seen.includes(key)) {
-      keys.push(key)
-      const how = one.status === 'exited' ? `exited${one.exitCode === null ? '' : ` with code ${one.exitCode}`}` : one.status === 'timeout' ? 'reached its deadline and was stopped' : one.status
-      lines.push(`${one.monitor ? 'Monitor' : 'Background command'} ${one.id} ${how}: ${(one.description || one.command).slice(0, 80)}${one.outputFile ? ` — output: ${one.outputFile}` : ''}`)
     }
   }
   return { keys, lines }
@@ -449,7 +412,7 @@ export function envText(paneId: string, role: Role, takeover: boolean): string {
   }
   const base = `herdr-commander: this Claude Code session runs inside herdr (pane ${paneId}, role ${role}). ListAgents also lists the herdr agents, each with a file you can Read for its latest output.`
   if (role === 'worker') {
-    return `${base}\nYou are a WORKER started by another agent. Work arrives as a one-line message that names a task file: read it and do the task. When you have the result, or need a decision, send it with SendMessage to "main" (it reaches whoever gave you the work), then end your turn: a message sent and then stopping completes the job. A reply continues the same job. Do not spawn further herdr workers.`
+    return `${base}\nYou are a WORKER started by another agent. The messages you receive here are your work from that agent, given to you directly (a very long one comes as a one-line note naming a file to read). When you have the result, or need a decision, send it with SendMessage to "main" (it reaches whoever gave you the work), then end your turn: a message sent and then stopping completes the job. A reply continues the same job. Do not spawn further herdr workers.`
   }
   return `${base} Agent with subagent_type herdr-commander:claude-worker or herdr-commander:codex-worker runs the work in a visible herdr pane; it reports with SendMessage and TaskStop ends it.`
 }

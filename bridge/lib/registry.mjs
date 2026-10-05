@@ -34,10 +34,6 @@ export const COMMANDS = {
   'report-session': { run: ops.reportSession },
   metadata: { run: ops.metadata },
   notify: { run: ops.notify },
-  'bg-run': { run: ops.bgRun },
-  'bg-status': { run: ops.bgStatus },
-  'bg-stop': { run: ops.bgStop },
-  'bg-list': { run: ops.bgList },
   'codex-args': { run: (ctx, args) => ({ args: ops.codexArgs(args) }) },
 }
 

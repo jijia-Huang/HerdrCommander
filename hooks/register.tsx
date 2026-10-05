@@ -3,9 +3,9 @@
 //
 // With the `takeover` switch on (the default), Claude's own tools go through
 // herdr: Agent with a herdr worker type opens a worker pane under a herdr id,
-// SendMessage / TaskStop / ListAgents / Read know those ids, and background
-// Bash / PowerShell and Monitor run in panes. Off, or outside herdr, every one
-// of them is Claude's own.
+// and SendMessage / TaskStop / ListAgents / Read know those ids. Background
+// Bash / PowerShell, Monitor and every other agent type stay Claude's own.
+// Off, or outside herdr, every tool is Claude's own.
 //
 // Every $ call lives in this file (the engine follows $ only within one file);
 // pure helpers are in ./pure. herdr itself is only ever run by the bridge
@@ -13,7 +13,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { AgentRow, BgRow, Gate, JobRow, Preview, Role, WorkerRow } from '../types'
+import type { AgentRow, Gate, JobRow, Preview, Role, WorkerRow } from '../types'
 import {
   ACTIVE_JOB,
   AGENT_SPECS,
@@ -39,7 +39,6 @@ import {
   runtimeRootOf,
   sentText,
   sortAgents,
-  toBg,
   toJobs,
   toRows,
   toWorkers,
@@ -54,7 +53,6 @@ const OFF_GATE: Gate = { inHerdr: false, paneId: '', workspaceId: '', role: 'pla
 const stGate = atom({ plugin: 'herdr-commander', key: 'gate' } as const, OFF_GATE)
 const stAgents = atom({ plugin: 'herdr-commander', key: 'agents' } as const, [] as AgentRow[])
 const stJobs = atom({ plugin: 'herdr-commander', key: 'jobs' } as const, [] as JobRow[])
-const stBg = atom({ plugin: 'herdr-commander', key: 'bg' } as const, [] as BgRow[])
 const stWorkers = atom({ plugin: 'herdr-commander', key: 'workers' } as const, [] as WorkerRow[])
 const stPanesDir = atom({ plugin: 'herdr-commander', key: 'panesDir' } as const, null as string | null)
 const stLease = atom({ plugin: 'herdr-commander', key: 'lease' } as const, null as string | null)
@@ -87,6 +85,8 @@ let sending = false
 let awaitingPermission = false
 /** When this pane's current turn began (ms), for the bridge's "stopped" check. */
 let turnStartedAt: number | null = null
+/** The role whose herdr text this session's model has been given (prompt context; see prompt.submit). */
+let briefedRole: Role | null = null
 let runtimeRoot = ''
 let options: Options = readOptions({})
 
@@ -104,8 +104,7 @@ function later($: EngineInterface, fn: () => Promise<unknown>): void {
 }
 
 /**
- * Whether a call that creates something (a worker, a background command, a
- * monitor) goes to herdr: the switch is on, this is a herdr pane that is not a
+ * Whether a call that creates a worker goes to herdr: the switch is on, this is a herdr pane that is not a
  * worker, and the call is the main loop's (a subagent's own calls stay native).
  * The bridge adds the last rule: a plain pane does not start panes while
  * another live pane is this workspace's commander.
@@ -186,7 +185,6 @@ async function runTick($: EngineInterface): Promise<void> {
     return
   }
   const pending = (await read($, stJobs)).some(job => job.from === g.paneId && ACTIVE_JOB.includes(job.status))
-    || (await read($, stBg)).some(one => one.status === 'running')
     || (await read($, stWorkers)).some(one => one.status === 'starting' || one.status === 'blocked')
   if (!pending) {
     stopPolling()
@@ -194,7 +192,7 @@ async function runTick($: EngineInterface): Promise<void> {
 }
 
 /** Applies a bridge snapshot to the atoms; returns the rows before and after. */
-async function absorb($: EngineInterface, snap: Snapshot): Promise<{ before: AgentRow[]; rows: AgentRow[]; jobRows: JobRow[]; bgRows: BgRow[]; workerRows: WorkerRow[] }> {
+async function absorb($: EngineInterface, snap: Snapshot): Promise<{ before: AgentRow[]; rows: AgentRow[]; jobRows: JobRow[]; workerRows: WorkerRow[] }> {
   const g = await read($, stGate)
   const now = await $.clock.now()
   const before = await read($, stAgents)
@@ -205,12 +203,6 @@ async function absorb($: EngineInterface, snap: Snapshot): Promise<{ before: Age
   const jobRows = toJobs(snap.jobs)
   if (JSON.stringify(jobRows) !== JSON.stringify(await read($, stJobs))) {
     await update($, stJobs, () => jobRows)
-  }
-  const bgRows = toBg(snap.bg)
-  const knownBg = await read($, stBg)
-  const mergedBg = [...knownBg.filter(one => !bgRows.some(row => row.id === one.id)).map(one => ({ ...one, newLines: [] })), ...bgRows]
-  if (JSON.stringify(mergedBg) !== JSON.stringify(knownBg)) {
-    await update($, stBg, () => mergedBg)
   }
   const workerRows = toWorkers(snap.workers ?? [])
   if (JSON.stringify(workerRows) !== JSON.stringify(await read($, stWorkers))) {
@@ -223,7 +215,7 @@ async function absorb($: EngineInterface, snap: Snapshot): Promise<{ before: Age
   if (holder !== (await read($, stLease))) {
     await update($, stLease, () => holder)
   }
-  return { before, rows, jobRows, bgRows: mergedBg, workerRows }
+  return { before, rows, jobRows, workerRows }
 }
 
 async function tick($: EngineInterface): Promise<void> {
@@ -233,9 +225,9 @@ async function tick($: EngineInterface): Promise<void> {
   }
   ticking = true
   try {
-    const snap = await bridge<Snapshot>($, 'snapshot', { bg: options.takeover }, false, 25000)
+    const snap = await bridge<Snapshot>($, 'snapshot', {}, false, 25000)
     const now = await $.clock.now()
-    const { before, rows, jobRows, bgRows, workerRows } = await absorb($, snap)
+    const { before, rows, jobRows, workerRows } = await absorb($, snap)
     if (g.role === 'commander' && options.notifications) {
       for (const { row, isBlocked } of transitions(before, rows, g.paneId)) {
         if (now - (lastNotified.get(row.paneId) ?? 0) < NOTIFY_GAP_MS) {
@@ -248,8 +240,8 @@ async function tick($: EngineInterface): Promise<void> {
       }
     }
 
-    // Wake once per job event / ended background command; old ones on (re)load stay quiet.
-    const news = notices(g.paneId, jobRows, bgRows, workerRows, await read($, stAnnounced))
+    // Wake once per job event; old ones on (re)load stay quiet.
+    const news = notices(g.paneId, jobRows, workerRows, await read($, stAnnounced))
     if (news.keys.length > 0) {
       await update($, stAnnounced, list => [...list, ...news.keys].slice(-400))
     }
@@ -403,43 +395,10 @@ async function choose($: EngineInterface, paneId: string): Promise<void> {
   await refreshPreview($)
 }
 
-/**
- * Runs a background command or monitor in a herdr pane, after the same
- * permission chain native would ask (`$.tool.check`): deny stays a deny, ask
- * goes back to native (which then asks), allow goes to herdr. Null: native.
- */
-async function backgroundInPane($: EngineInterface, tool: 'Bash' | 'PowerShell' | 'Monitor', input: Record<string, unknown>, args: Record<string, unknown>): Promise<{ deny: string } | { bg: { id: string; pane_id: string; output_file: string } } | { native: string }> {
-  const verdict = await $.tool.check({ tool, input })
-  if (verdict.decision === 'deny') {
-    return { deny: verdict.reason ?? `${tool} denied` }
-  }
-  if (verdict.decision !== 'allow') {
-    return { native: `the permission check said "${verdict.decision}"${verdict.reason ? ` (${verdict.reason})` : ''}, so Claude Code ran it itself` }
-  }
-  try {
-    const out = await bridge<{ bg: { id: string; pane_id: string; output_file: string } }>($, 'bg-run', { ...args, cwd: await $.session.cwd() })
-    await ensurePolling($)
-    return out
-  } catch (error) {
-    return { native: `herdr could not start it (${errorText(error)}), so Claude Code ran it itself` }
-  }
-}
-
-/** Native result of a background call herdr did not take, with why (for the model, and for checking). */
-function withWhy<T extends { deny?: unknown; context?: readonly string[] }>(ran: T, why: string): T {
-  return ran.deny !== undefined ? ran : { ...ran, context: [...(ran.context ?? []), `herdr: not in a herdr pane: ${why}.`] }
-}
-
-function bgContext(out: { bg: { id: string; pane_id: string; output_file: string } }, isMonitor: boolean): string {
-  const what = isMonitor
-    ? 'Each output line comes to you as a notification while you are idle; it is stopped at its deadline.'
-    : 'You are notified when it exits, with its exit code.'
-  return `herdr: this ${isMonitor ? 'monitor' : 'background command'} runs in a visible herdr pane (${out.bg.pane_id}). Its output goes to ${out.bg.output_file}, not to the path in the line above: Read that file for it. ${what} TaskStop ${out.bg.id} stops it and closes the pane.`
-}
-
 export const register: Register = (on, rawOptions) => {
   options = readOptions(rawOptions)
   toolRegistered = false
+  briefedRole = null
 
   // The one tool: a herdr worker in another folder ---------------------------------
 
@@ -529,18 +488,30 @@ export const register: Register = (on, rawOptions) => {
 
   // Turns: this pane's state for herdr, and "this pane stopped" for its jobs -------
 
+  // The herdr text rides on the prompt as context (the model reads it, the
+  // person does not see it): a policy plugin may bypass a user plugin's
+  // prompt.compose, as measured on 2026-10-05, so the system prompt alone is
+  // not enough. A worker gets it with every prompt, since its work arrives as
+  // plain messages; the other roles once per role.
   on('prompt.submit', async ($, e, next) => {
     const g = await read($, stGate)
-    if (g.inHerdr) {
-      // A prompt delivered into a running turn does not start a turn.
-      if (e.turnId === undefined) {
-        turnStartedAt = await $.clock.now()
-      }
-      if (options.lifecycleReport) {
-        want($, 'working')
-      }
+    if (!g.inHerdr) {
+      return next(e)
     }
-    return next(e)
+    // A prompt delivered into a running turn does not start a turn.
+    if (e.turnId === undefined) {
+      turnStartedAt = await $.clock.now()
+    }
+    if (options.lifecycleReport) {
+      want($, 'working')
+    }
+    const brief = g.role === 'worker' || briefedRole !== g.role
+    if (!brief) {
+      return next(e)
+    }
+    briefedRole = g.role
+    const notes = [envText(g.paneId, g.role, options.takeover), ...(g.role === 'commander' ? [ROLE_TEXT] : [])]
+    return next({ ...e, context: [...(e.context ?? []), ...notes] })
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -669,14 +640,11 @@ export const register: Register = (on, rawOptions) => {
         return next(e)
       }
       try {
-        const out = await bridge<{ matched?: false; kind?: 'agent' | 'bg'; herdr_id?: string | null; pane_id?: string | null; bg?: { id: string; command: string } }>($, 'stop', { target: id })
+        const out = await bridge<{ matched?: false; herdr_id?: string | null; pane_id?: string | null }>($, 'stop', { target: id })
         if (out.matched === false) {
           return next(e)
         }
         later($, () => runTick($))
-        if (out.kind === 'bg' && out.bg) {
-          return { result: { message: `Stopped ${out.bg.id} and closed its herdr pane.`, task_id: out.bg.id, task_type: 'herdr_bg', command: out.bg.command } }
-        }
         return { result: { message: `Stopped herdr worker ${out.herdr_id ?? out.pane_id} (Ctrl+C) and closed its pane${out.pane_id ? ` ${out.pane_id}` : ''}.`, task_id: id, task_type: 'herdr_agent' } }
       } catch (error) {
         return { deny: `herdr: ${errorText(error)}` }
@@ -692,7 +660,7 @@ export const register: Register = (on, rawOptions) => {
       }
       let extra: string
       try {
-        const { rows, workerRows } = await absorb($, await bridge<Snapshot>($, 'snapshot', { bg: true }, false, 25000))
+        const { rows, workerRows } = await absorb($, await bridge<Snapshot>($, 'snapshot', {}, false, 25000))
         const panesDir = (await read($, stPanesDir)) ?? `${runtimeRoot}/${g.workspaceId}/panes`
         extra = herdrListing(workerRows, rows, panesDir)
       } catch (error) {
@@ -722,53 +690,6 @@ export const register: Register = (on, rawOptions) => {
         return { decision: 'allow' as const, reason: 'herdr-commander runtime file (worker output, pane screen)' }
       }
       return next(e)
-    })
-
-    // Background Bash / PowerShell (asked for at the call; Ctrl+B and timeouts stay
-    // native) and Monitor commands (its WebSocket form stays native).
-    on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-      const g = await read($, stGate)
-      if (e.run_in_background !== true || mayCreate(g, e.agentId)) {
-        return next(e)
-      }
-      const out = await backgroundInPane($, 'Bash', { command: e.command, description: e.description, run_in_background: true }, { command: e.command, shell: 'bash', description: e.description })
-      if ('native' in out) {
-        return withWhy(await next(e), out.native)
-      }
-      if ('deny' in out) {
-        return out
-      }
-      return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: out.bg.id }, context: [bgContext(out, false)] }
-    })
-
-    on('tool.call', { tool: 'PowerShell' }, async ($, e, next) => {
-      const g = await read($, stGate)
-      if (e.run_in_background !== true || mayCreate(g, e.agentId)) {
-        return next(e)
-      }
-      const out = await backgroundInPane($, 'PowerShell', { command: e.command, description: e.description, run_in_background: true }, { command: e.command, shell: 'powershell', description: e.description })
-      if ('native' in out) {
-        return withWhy(await next(e), out.native)
-      }
-      if ('deny' in out) {
-        return out
-      }
-      return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: out.bg.id }, context: [bgContext(out, false)] }
-    })
-
-    on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
-      const g = await read($, stGate)
-      if (typeof e.command !== 'string' || e.ws !== undefined || mayCreate(g, e.agentId)) {
-        return next(e)
-      }
-      const out = await backgroundInPane($, 'Monitor', { command: e.command, description: e.description, timeout_ms: e.timeout_ms }, { command: e.command, shell: 'bash', monitor: true, timeout_ms: e.timeout_ms, description: e.description })
-      if ('native' in out) {
-        return withWhy(await next(e), out.native)
-      }
-      if ('deny' in out) {
-        return out
-      }
-      return { result: { taskId: out.bg.id, timeoutMs: Math.min(1800000, e.timeout_ms) }, context: [bgContext(out, true)] }
     })
 
     // $.session.send from other plugins follows the same rules as SendMessage.

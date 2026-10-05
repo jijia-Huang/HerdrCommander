@@ -55,7 +55,7 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
     toasts: [],
     statuses: [],
     replies: {
-      snapshot: { agents: AGENTS, lease: null, jobs: [], bg: [], workers: [], panes_dir: 'C:/rt/wA/panes' },
+      snapshot: { agents: AGENTS, lease: null, jobs: [], workers: [], panes_dir: 'C:/rt/wA/panes' },
       agents: AGENTS,
       claim: { claimed: true, holder: { pane_id: 'wA:p1', kind: 'claude' } },
       release: { released: true },

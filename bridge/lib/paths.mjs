@@ -28,7 +28,7 @@ export function isInstalledCopy(root = TOOL_ROOT) {
   return /[\\/]plugins[\\/]cache[\\/]/i.test(root)
 }
 
-/** One workspace's folder: jobs/, results/, bg/, lease.json, owned.json. */
+/** One workspace's folder: jobs/, results/, tasks/, workers/, out/, panes/, lease.json, owned.json. */
 export function workspaceDir(workspaceId) {
   if (!/^[A-Za-z0-9_-]+$/.test(workspaceId)) {
     throw new BridgeError('bad_workspace', `invalid workspace id: ${workspaceId}`)

@@ -49,7 +49,6 @@ export class Store {
     this.jobsDir = ensure(join(this.dir, 'jobs'))
     this.resultsDir = ensure(join(this.dir, 'results'))
     this.tasksDir = ensure(join(this.dir, 'tasks'))
-    this.bgDir = ensure(join(this.dir, 'bg'))
     this.workersDir = ensure(join(this.dir, 'workers'))
     this.outDir = ensure(join(this.dir, 'out'))
     this.panesDir = ensure(join(this.dir, 'panes'))
@@ -97,13 +96,6 @@ export class Store {
     return join(this.panesDir, `${safe}.txt`)
   }
 
-  /** A background command's own files: script, runner, log, exit code. */
-  bgFile(id, suffix) {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
-      throw new Error(`invalid background id: ${id}`)
-    }
-    return join(this.bgDir, `${id}${suffix}`)
-  }
 
   // Jobs ---------------------------------------------------------------
 
@@ -172,32 +164,5 @@ export class Store {
 
   isOwned(paneId) {
     return this.getOwned().some(one => one.pane_id === paneId)
-  }
-
-  // Background commands --------------------------------------------------
-
-  bgPath(id) {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
-      throw new Error(`invalid background id: ${id}`)
-    }
-    return join(this.bgDir, `${id}.json`)
-  }
-
-  getBg(id) {
-    return readJson(this.bgPath(id), null)
-  }
-
-  putBg(bg) {
-    writeJson(this.bgPath(bg.id), bg)
-  }
-
-  listBg() {
-    if (!existsSync(this.bgDir)) {
-      return []
-    }
-    return readdirSync(this.bgDir)
-      .filter(name => name.endsWith('.json'))
-      .map(name => readJson(join(this.bgDir, name), null))
-      .filter(Boolean)
   }
 }

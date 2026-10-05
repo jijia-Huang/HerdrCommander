@@ -1,6 +1,6 @@
 {
   "name": "herdr-bridge",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Shared herdr layer for the herdr-commander Claude mod and Codex: CLI, STDIO MCP server, dashboard. No dependencies.",
   "type": "module",

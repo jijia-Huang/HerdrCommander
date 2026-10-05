@@ -3,7 +3,7 @@
 // `byUser` is set only by the Claude mod's panel buttons (a person pressed
 // them); model-driven calls (MCP, the mod's tools) never set it.
 import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { runJson, runText } from './herdr.mjs'
@@ -307,13 +307,16 @@ function messagePrompt(job, path, pending) {
 }
 
 /**
- * Types the prompt and, for a Codex target, makes sure it was submitted: a
- * paste typed into a just-started Codex sometimes keeps the text and drops
- * the Enter. An extra Enter on an empty or already-sent box does nothing.
+ * Types the prompt and, for a Codex or Claude target, makes sure it was
+ * submitted: a paste typed into a just-started agent sometimes keeps the text
+ * and drops the Enter (seen with Codex, and on 2026-10-05 with a multi-line
+ * task typed into a Claude worker that had just come up). When the pane does
+ * not turn to working within ~4 s, one Enter follows; an Enter on an empty or
+ * already-sent box does nothing.
  */
 async function deliver(paneId, kind, text) {
   await runJson(['agent', 'prompt', paneId, text], { timeoutMs: 15000 })
-  if (kind !== 'codex') {
+  if (kind !== 'codex' && kind !== 'claude') {
     return { nudged: false }
   }
   for (let i = 0; i < 4; i += 1) {
@@ -327,7 +330,49 @@ async function deliver(paneId, kind, text) {
   return { nudged: true }
 }
 
-/** Hands a job's task (first time) or its undelivered sender messages to the worker pane. */
+/**
+ * The most text typed straight into a pane. `herdr agent prompt` gets the text
+ * as one command-line argument, and Windows caps a whole command line at
+ * 32,767 UTF-16 code units: measured 2026-10-05, a 31,081-character prompt
+ * reached a Claude worker whole, and 33,000 failed to start herdr with
+ * ENAMETOOLONG. 30,000 (JavaScript string length, which counts UTF-16 code
+ * units) leaves room for herdr's path and the other arguments.
+ */
+export const DIRECT_LIMIT = 30000
+
+/**
+ * The text as it is typed into a Claude worker, or null when it has to go
+ * through a file instead: too long for one command line, a control character
+ * the terminal would act on (newlines and tabs arrive intact, measured), or a
+ * first character Claude Code reads as a command (`/`), shell (`!`) or
+ * memory (`#`) line rather than as a message.
+ */
+export function directText(text) {
+  const clean = String(text).replace(/\r\n?/g, '\n')
+  if (clean.trim() === '' || clean.length > DIRECT_LIMIT) {
+    return null
+  }
+  if (/[\u0000-\u0008\u000b-\u001f\u007f]/.test(clean) || /^\s*[/!#]/.test(clean)) {
+    return null
+  }
+  return clean
+}
+
+/** A Claude worker the bridge started: it gets its work as plain messages (its prompt says how to answer). */
+function isClaudeWorker(job, paneId, kind) {
+  if (!isClaude(kind)) {
+    return false
+  }
+  return Boolean(job.worker) || runtimeWorkspaces().some(ws => storeFor(ws).getOwned().some(one => one.pane_id === paneId && one.kind === 'claude'))
+}
+
+/**
+ * Hands a job's task (first time) or its undelivered sender messages to the
+ * worker pane. A Claude worker gets the content itself, as a native message;
+ * only text that cannot be typed safely (directText) goes by a file and a
+ * one-line note. Others (Codex, or a Claude pane that is not a worker) get the
+ * one-line `[herdr-job …]` note with the file, as before.
+ */
 async function deliverJob(store, job, paneId, kind) {
   // A first delivery goes out once, even when two bridge processes pump at once.
   const fresh = store.getJob(job.job_id)
@@ -338,19 +383,24 @@ async function deliverJob(store, job, paneId, kind) {
   const first = !job.delivered_at
   let text
   let next = { ...job, to: paneId, to_kind: kind }
+  if (!first && pending.length === 0) {
+    return job
+  }
+  const content = first ? [job.body, ...pending.map(one => one.text)].join('\n\n') : pending.map(one => one.text).join('\n\n')
+  const direct = isClaudeWorker(job, paneId, kind) ? directText(content) : null
   if (first) {
     writeFileSync(next.task_path, `${BOM}${jobTaskFile(next, pending)}`, 'utf8')
-    text = jobPrompt(next)
+    text = direct ?? jobPrompt(next)
+  } else if (direct !== null) {
+    text = direct
   } else {
-    if (pending.length === 0) {
-      return job
-    }
     const path = join(store.tasksDir, `${job.job_id}-m${pending[pending.length - 1].seq}.md`)
     writeFileSync(path, `${BOM}${messageFile(next, pending)}`, 'utf8')
     text = messagePrompt(next, path, pending)
   }
   next = {
     ...next,
+    delivered_as: direct !== null ? 'text' : 'file',
     delivered_at: now(),
     messages: (next.messages ?? []).map(one => (one.from === 'sender' ? { ...one, delivered: true } : one)),
   }
@@ -1011,22 +1061,15 @@ export async function workerStart(ctx, { herdr_id: herdrId }) {
 }
 
 /**
- * TaskStop: ends a herdr worker (Ctrl+C, then its pane closes) or a herdr
- * background command, without asking (as native TaskStop). Only panes this
- * caller started; `matched: false` when the id is not herdr's at all.
+ * TaskStop: ends a herdr worker (Ctrl+C, then its pane closes), without asking
+ * (as native TaskStop). Only workers this caller started; `matched: false`
+ * when the id is not herdr's at all.
  */
 export async function stop(ctx, { target }) {
   requireFrom(ctx)
   const ws = requireWorkspace(ctx)
   const name = String(target ?? '')
   const store = storeFor(ws)
-  const bg = name.startsWith('herdr-') ? store.getBg(name) : null
-  if (bg) {
-    if (bg.owner !== ctx.from) {
-      throw new BridgeError('not_owner', `${name} was started by ${bg.owner}, not by you`)
-    }
-    return { kind: 'bg', ...(await bgStop(ctx, { id: name, close: true })) }
-  }
   const hit = await resolveRecipient(ctx, name)
   if (!hit) {
     return { matched: false }
@@ -1264,198 +1307,15 @@ export async function notify(ctx, { title, body, sound = 'none' }) {
   return { shown: true }
 }
 
-// Background commands and monitors (Bash / PowerShell run_in_background, Monitor) --
-//
-// Each runs in its own pane below the caller. The command goes into a script
-// file, never onto the pane's command line (PowerShell 5.1 mangles quotes);
-// a runner script tees its output into a UTF-8 log (the outputFile the model
-// Reads) and writes the exit code into a file of its own, which is how the
-// bridge learns the command ended: no screen parsing.
-
-/** Git Bash, for Bash-tool commands: HERDR_BRIDGE_BASH or CLAUDE_CODE_GIT_BASH_PATH, else the usual install. */
-export function bashPath() {
-  const candidates = [process.env.HERDR_BRIDGE_BASH, process.env.CLAUDE_CODE_GIT_BASH_PATH, 'C:\\Program Files\\Git\\bin\\bash.exe'].filter(Boolean)
-  return candidates.find(path => existsSync(path)) ?? 'bash'
-}
-
-function posix(path) {
-  return String(path).replace(/\\/g, '/')
-}
-
-function bashQuote(text) {
-  return `'${String(text).replace(/'/g, `'\\''`)}'`
-}
-
-function psQuote(text) {
-  return `'${String(text).replace(/'/g, "''")}'`
-}
-
-/** Writes the command and its runner; returns the line typed into the pane's PowerShell. */
-export function bgScripts(store, id, shell, command) {
-  const log = store.bgFile(id, '.log')
-  const exit = store.bgFile(id, '.exit')
-  writeFileSync(log, '', 'utf8')
-  rmSync(exit, { force: true })
-  if (shell === 'bash') {
-    const cmd = store.bgFile(id, '.cmd.sh')
-    const runner = store.bgFile(id, '.run.sh')
-    writeFileSync(cmd, `${command}\n`, 'utf8')
-    // `exit` in the command ends only the subshell; PIPESTATUS keeps its code past tee.
-    writeFileSync(runner, [
-      `( source ${bashQuote(posix(cmd))} ) 2>&1 | tee -a ${bashQuote(posix(log))}`,
-      `echo "\${PIPESTATUS[0]}" > ${bashQuote(posix(exit))}`,
-      '',
-    ].join('\n'), 'utf8')
-    return `& ${psQuote(bashPath())} ${psQuote(runner)}`
-  }
-  const cmd = store.bgFile(id, '.cmd.ps1')
-  writeFileSync(cmd, `${BOM}${command}\n`, 'utf8')
-  // The command runs in a child powershell.exe given as -EncodedCommand, so an
-  // `exit` in it ends the child (its exit code) and never the pane's shell.
-  const runner = [
-    '$enc = New-Object System.Text.UTF8Encoding($false)',
-    `$cmd = [IO.File]::ReadAllText(${psQuote(cmd)})`,
-    '$b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))',
-    `& powershell.exe -NoLogo -NoProfile -EncodedCommand $b64 2>&1 | ForEach-Object { $s = "$_"; Write-Host $s; [IO.File]::AppendAllText(${psQuote(log)}, $s + [Environment]::NewLine, $enc) }`,
-    `[IO.File]::WriteAllText(${psQuote(exit)}, [string]$LASTEXITCODE, $enc)`,
-  ].join('\n')
-  return `powershell.exe -NoLogo -NoProfile -EncodedCommand ${Buffer.from(runner, 'utf16le').toString('base64')}`
-}
-
-/**
- * Runs a command in a new pane below the caller under a herdr id
- * (`herdr-bg-…`, or `herdr-mon-…` for a Monitor, whose each output line is an
- * event and which is stopped at its deadline). Same start rules as workers.
- */
-export async function bgRun(ctx, { command, cwd, name, shell = 'powershell', monitor = false, timeout_ms: timeoutMs, description }) {
-  const ws = await requireMayStart(ctx)
-  if (typeof command !== 'string' || command.trim() === '') {
-    throw new BridgeError('bad_command', 'command is required')
-  }
-  if (!['bash', 'powershell'].includes(shell)) {
-    throw new BridgeError('bad_shell', 'shell must be bash or powershell')
-  }
-  const store = storeFor(ws)
-  const id = newHerdrId(monitor ? 'mon' : 'bg', ws)
-  const line = bgScripts(store, id, shell, command)
-  const split = await runJson([
-    'pane', 'split', '--pane', ctx.from, '--direction', 'down',
-    '--cwd', cwd || process.cwd(),
-    '--env', 'HERDR_COMMANDER_ROLE=worker',
-    '--no-focus',
-  ])
-  const paneId = split?.pane?.pane_id
-  if (!paneId) {
-    throw new BridgeError('split_failed', 'herdr did not return the new pane id')
-  }
-  store.addOwned({ pane_id: paneId, owner: ctx.from, kind: 'shell', name: name || id, created_at: now() })
-  const timeout = monitor ? Math.max(1000, Math.min(1800000, Number(timeoutMs) || 300000)) : null
-  const bg = {
-    id,
-    herdr_id: id,
-    pane_id: paneId,
-    owner: ctx.from,
-    command,
-    name: name || null,
-    description: description ?? null,
-    shell,
-    monitor: Boolean(monitor),
-    deadline: timeout ? new Date(Date.now() + timeout).toISOString() : null,
-    output_file: store.bgFile(id, '.log'),
-    exit_path: store.bgFile(id, '.exit'),
-    lines_seen: 0,
-    status: 'running',
-    started_at: now(),
-  }
-  store.putBg(bg)
-  await runJson(['pane', 'rename', paneId, `${monitor ? 'mon' : 'bg'}:${(description || name || command).slice(0, 30)}`]).catch(() => {})
-  await runJson(['pane', 'run', paneId, line])
-  return { bg }
-}
-
-function readLog(path) {
-  try {
-    return readFileSync(path, 'utf8')
-  } catch {
-    return ''
-  }
-}
-
-/** A background command's status from its exit file; a monitor's new lines since the last look. */
-export async function bgStatus(ctx, { id, lines = 60 }) {
-  const store = storeFor(requireWorkspace(ctx))
-  const bg = store.getBg(String(id))
-  if (!bg) {
-    throw new BridgeError('no_bg', `no background command ${id}`)
-  }
-  if (bg.status !== 'running') {
-    return { bg }
-  }
-  let next = bg
-  const fresh = []
-  if (bg.monitor) {
-    const all = readLog(bg.output_file).split(/\r?\n/)
-    const complete = all.slice(0, -1)
-    if (complete.length > (bg.lines_seen ?? 0)) {
-      fresh.push(...complete.slice(bg.lines_seen ?? 0))
-      next = { ...next, lines_seen: complete.length }
-    }
-  }
-  if (existsSync(bg.exit_path)) {
-    const code = Number.parseInt(readLog(bg.exit_path).trim(), 10)
-    next = { ...next, status: 'exited', exit_code: Number.isNaN(code) ? null : code, ended_at: now() }
-  } else if (bg.deadline && Date.now() > Date.parse(bg.deadline)) {
-    await runJson(['pane', 'send-keys', bg.pane_id, 'ctrl+c']).catch(() => {})
-    await closePane(ctx, { pane: bg.pane_id }).catch(() => {})
-    next = { ...next, status: 'timeout', ended_at: now() }
-  } else {
-    const pane = await runJson(['pane', 'get', bg.pane_id]).catch(() => null)
-    if (!pane?.pane) {
-      next = { ...next, status: 'lost', ended_at: now() }
-    }
-  }
-  if (next !== bg) {
-    store.putBg(next)
-  }
-  const tail = readLog(bg.output_file).split(/\r?\n/).slice(-Math.max(1, Math.min(400, Number(lines) || 60))).join('\n')
-  return { bg: next, tail, new_lines: fresh }
-}
-
-export async function bgStop(ctx, { id, close = false }) {
-  const store = storeFor(requireWorkspace(ctx))
-  const bg = store.getBg(String(id))
-  if (!bg) {
-    throw new BridgeError('no_bg', `no background command ${id}`)
-  }
-  if (ctx.from && bg.owner !== ctx.from && !ctx.byUser) {
-    throw new BridgeError('not_owner', `${id} belongs to ${bg.owner}`)
-  }
-  let stopped = bg
-  if (bg.status === 'running') {
-    await runJson(['pane', 'send-keys', bg.pane_id, 'ctrl+c']).catch(() => {})
-    stopped = { ...bg, status: 'stopped', ended_at: now() }
-    store.putBg(stopped)
-  }
-  if (close) {
-    await closePane(ctx, { pane: bg.pane_id }).catch(() => {})
-  }
-  return { bg: stopped }
-}
-
-export function bgList(ctx) {
-  const store = storeFor(requireWorkspace(ctx))
-  return { bg: store.listBg().filter(one => !ctx.from || one.owner === ctx.from) }
-}
-
 // One-call view for the Claude mod's poll ----------------------------------------
 
 /**
  * Agents, this workspace's lease, the caller's jobs (reconciled, with their
- * messages and events), its herdr workers and its background commands, in one
- * process. It also moves things on: a worker that was blocked at start and is
- * now idle gets its queued job.
+ * messages and events) and its herdr workers, in one process. It also moves
+ * things on: a worker that was blocked at start and is now idle gets its
+ * queued job.
  */
-export async function snapshot(ctx, { bg = true } = {}) {
+export async function snapshot(ctx) {
   const agents = await listAgents(ctx)
   const store = storeFor(requireWorkspace(ctx))
   const workers = store.listWorkers().filter(one => one.owner === ctx.from)
@@ -1470,13 +1330,6 @@ export async function snapshot(ctx, { bg = true } = {}) {
   const list = store.listJobs().filter(job => !ctx.from || job.from === ctx.from || job.to === ctx.from)
   const shown = [...list.filter(job => ACTIVE_JOB.has(job.status)), ...list.filter(job => !ACTIVE_JOB.has(job.status)).slice(0, 20)]
   const reconciled = await Promise.all(shown.map(job => reconcile(store, job)))
-  const bgs = []
-  if (bg) {
-    for (const one of store.listBg().filter(row => row.owner === ctx.from && row.status === 'running')) {
-      const status = await bgStatus(ctx, { id: one.id, lines: 1 })
-      bgs.push({ ...status.bg, new_lines: status.new_lines })
-    }
-  }
   const jobsByWorker = new Map()
   for (const job of reconciled) {
     if (job.worker) {
@@ -1487,7 +1340,7 @@ export async function snapshot(ctx, { bg = true } = {}) {
     const own = jobsByWorker.get(worker.herdr_id) ?? []
     return { ...worker, job: own.find(job => OPEN_JOB.has(job.status))?.job_id ?? null, queued: jobsFor({ worker, paneId: worker.pane_id ?? '' }).filter(({ job }) => job.status === 'queued').length }
   })
-  return { agents, lease: store.getLease(), jobs: reconciled, bg: bgs, workers: view, runtime: runtimeRoot(), panes_dir: store.panesDir }
+  return { agents, lease: store.getLease(), jobs: reconciled, workers: view, runtime: runtimeRoot(), panes_dir: store.panesDir }
 }
 
 // Codex launch arguments (one source for herdr-codex.ps1 and spawn) ---------------

@@ -56,19 +56,6 @@ export type JobRow = {
   events: JobEvent[]
 }
 
-export type BgRow = {
-  id: string
-  paneId: string
-  command: string
-  status: string
-  exitCode: number | null
-  outputFile: string
-  monitor: boolean
-  description: string
-  /** A monitor's output lines new since the last poll. */
-  newLines: string[]
-}
-
 /** A herdr worker this pane started (Agent takeover or herdr_worker_spawn). */
 export type WorkerRow = {
   herdrId: string
@@ -92,7 +79,6 @@ declare module 'claude-code' {
       gate: Gate
       agents: AgentRow[]
       jobs: JobRow[]
-      bg: BgRow[]
       workers: WorkerRow[]
       /** The bridge's folder of pane screen files (from the last poll). */
       panesDir: string | null
@@ -104,7 +90,7 @@ declare module 'claude-code' {
       pendingInterrupt: string | null
       paneOpen: boolean
       notice: string | null
-      /** Job event keys and background ids that already woke the session. */
+      /** Job event keys that already woke the session. */
       announced: string[]
     }
   }
