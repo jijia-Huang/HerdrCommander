@@ -558,3 +558,30 @@ test('claude workers can be started on another model', () => {
   assert.equal(ops.claudeLine('C:\\Users\\me\\.claude\\plugins\\cache\\h\\h\\0.2.0', { model: 'sonnet' }), 'claude --model sonnet')
   assert.equal(ops.claudeLine('D:\\x', { model: 'bad model;' }), "claude --plugin-dir 'D:\\x'")
 })
+
+test('reopening a job a codex worker completed keeps its result: renamed and in the messages', async () => {
+  const codex = { from: 'wA:p3', workspace: 'wA', role: 'worker', byUser: false }
+  const { job } = await ops.message(me, { to: 'wA:p3', text: 'review it' })
+  await ops.jobComplete(codex, { job_id: job.job_id, summary: 'ok', result: 'FIRST RESULT: 2 findings' })
+  const reopened = await ops.message(me, { to: 'wA:p3', text: 'fix finding 2' })
+  assert.equal(reopened.action, 'reopened')
+  assert.equal(reopened.job.status, 'sent')
+  assert.match(readFileSync(join(new Store('wA').resultsDir, `${job.job_id}.round1.md`), 'utf8'), /FIRST RESULT/)
+  assert.match(reopened.job.messages.find(one => one.from === 'worker').text, /FIRST RESULT: 2 findings/)
+  assert.equal(existsSync(job.result_path), false)
+  const again = await ops.jobComplete(codex, { job_id: job.job_id, summary: 'fixed', result: 'SECOND RESULT' })
+  assert.equal(again.job.status, 'completed')
+  assert.match(readFileSync(job.result_path, 'utf8'), /SECOND RESULT/)
+})
+
+test('a job is finished once even if two callers finish it', async () => {
+  claudeWorker()
+  const { job } = await ops.message(me, { to: 'wA:p2', text: 'x' })
+  await ops.reply(worker, { to: 'main', text: 'answer' })
+  const stale = new Store('wA').getJob(job.job_id)
+  await ops.turnEnd(worker, {})
+  writeFileSync(logPath, '')
+  writeFileSync(stale.result_path, `job_id: ${job.job_id}\n\nanswer\n`)
+  const out = await ops.jobGet(me, { job_id: job.job_id })
+  assert.equal(out.job.events.filter(one => one.type === 'completed').length, 1)
+})

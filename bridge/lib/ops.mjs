@@ -3,7 +3,7 @@
 // `byUser` is set only by the Claude mod's panel buttons (a person pressed
 // them); model-driven calls (MCP, the mod's tools) never set it.
 import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { runJson, runText } from './herdr.mjs'
@@ -329,6 +329,11 @@ async function deliver(paneId, kind, text) {
 
 /** Hands a job's task (first time) or its undelivered sender messages to the worker pane. */
 async function deliverJob(store, job, paneId, kind) {
+  // A first delivery goes out once, even when two bridge processes pump at once.
+  const fresh = store.getJob(job.job_id)
+  if (!job.delivered_at && fresh && fresh.status !== 'queued') {
+    return fresh
+  }
   const pending = (job.messages ?? []).filter(one => one.from === 'sender' && !one.delivered)
   const first = !job.delivered_at
   let text
@@ -451,6 +456,29 @@ async function pump(target) {
 // Sending: sender → worker ------------------------------------------------------
 
 /**
+ * A completed job made ready to reopen. Its result file goes out of the way
+ * (the result header would complete it again at once), but nothing is lost:
+ * the file is renamed to `<job>.round<n>.md`, and a result handed in by tool
+ * or file (not already one of the worker's messages) joins the messages.
+ */
+function keepResult(store, job) {
+  const round = (job.reopened ?? 0) + 1
+  const own = store.resultPath(job.job_id)
+  let next = { ...job, status: 'queued', queued_at: now(), result_path: own, replied_at: null, reminded_at: null, woken: null, reopened: round }
+  if (job.completed_via !== 'message' && job.result_path && existsSync(job.result_path)) {
+    const text = readFileSync(job.result_path, 'utf8').replace(/^\uFEFF?job_id:[^\n]*\n+/, '').trim()
+    if (text !== '') {
+      next = withMessage(next, 'worker', `(result of round ${round}, ${job.result_path})\n\n${text}`)
+      next = { ...next, messages: next.messages.map(one => (one.seq === next.seq ? { ...one, delivered: true } : one)) }
+    }
+  }
+  if (existsSync(own)) {
+    renameSync(own, join(store.resultsDir, `${job.job_id}.round${round}.md`))
+  }
+  return next
+}
+
+/**
  * A message from a sender to a worker. A job this sender has open (or queued)
  * with the worker takes it in and gets it now; else the sender's latest
  * completed job with the worker reopens; else a new job. A worker busy with
@@ -497,14 +525,7 @@ export async function message(ctx, { to, text, kind = 'task' }) {
   let held
   let action
   if (last) {
-    const own = last.store.resultPath(last.job.job_id)
-    if (last.job.result_path === own) {
-      rmSync(own, { force: true })
-    }
-    held = {
-      store: last.store,
-      job: withMessage({ ...last.job, status: 'queued', queued_at: now(), result_path: own, replied_at: null, reminded_at: null, woken: null, reopened: (last.job.reopened ?? 0) + 1 }, 'sender', text),
-    }
+    held = { store: last.store, job: withMessage(keepResult(last.store, last.job), 'sender', text) }
     action = 'reopened'
   } else {
     const store = storeFor(ws)
@@ -625,6 +646,11 @@ export async function turnEnd(ctx, { started_at: startedAt } = {}) {
 
 /** Marks a job completed (any route) and runs what follows once. */
 async function finishJob(store, job) {
+  // Another bridge process may have finished it a moment ago: finish once.
+  const fresh = store.getJob(job.job_id)
+  if (fresh && !OPEN_JOB.has(fresh.status)) {
+    return fresh
+  }
   const done = { ...job, status: 'completed', completed_at: now() }
   if (job.completed_via === 'message') {
     const sent = (job.messages ?? []).filter(one => one.from === 'worker')
