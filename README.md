@@ -2,30 +2,49 @@
 
 讓 Claude Code 與 Codex 在 [herdr](https://herdr.dev)（terminal multiplexer for coding agents）裡協作的工具組：
 
-- **claude-mod/**：Claude Code mod（function-hook plugin，Claude Code 2.1.287）。在 herdr 裡提供 `/commander` 面板、herdr 狀態回報、跨 agent job；**不在 herdr 裡時完全不生效**。
+- **repo 根目錄就是 Claude Code plugin**（`.claude-plugin/plugin.json`、`hooks/`、`types/`、`tests/`）：function-hook mod（Claude Code 2.1.287+）。在 herdr 裡提供 `/commander` 面板、herdr 狀態回報、跨 agent job；**不在 herdr 裡時完全不生效**。`.claude-plugin/marketplace.json` 讓這個 repo 同時也是 marketplace。
 - **bridge/**：herdr-bridge，Claude 與 Codex 共用的一層（Node 22、純 JS、零相依）。所有 herdr 操作、job 紀錄、安全規則都在這裡。提供 CLI、STDIO MCP server、Codex 用的 dashboard。
 - **codex/**：Codex 啟動器 `herdr-codex.ps1` 與 commander／worker 手則。
 
 計畫與逐 API 決策：`~/.claude/plans/gentle-exploring-parrot.md`（Codex 端原始提案：`~/.claude/plans/codex-herdr-commander.md`）。
 
-## 隔離原則
+## 安裝（從 GitHub）
 
-整套只放在這個資料夾，**不寫任何全域位置**：不改 `~/.claude/settings.json`、`~/.claude/skills`、`~/.codex/*`、PATH、全域 npm。執行期資料寫在 `.runtime/`（已 gitignore）。
+repo 是 private，git 要能用你的帳號存取（走 HTTPS 的話，先跑過 `gh auth login` 與 `gh auth setup-git`）。
 
-- Claude：只在你啟動時加 `--plugin-dir` 的那個 session 生效。
-- Codex：只在用 `herdr-codex.ps1` 或 bridge 開出來的那個 Codex 生效，全部用 `codex -c` 覆寫帶入；普通 `codex` 不受影響。
+```powershell
+claude plugin marketplace add jijia-Huang/HerdrCommander
+claude plugin install herdr-commander@herdr-commander
+```
+
+裝好後所有 Claude session 都會載入它，但**不在 herdr 裡時完全不生效**（每個 hook 都先檢查 `HERDR_ENV`／`HERDR_PANE_ID`）。
+
+更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.1.0`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
+
+```powershell
+claude plugin update herdr-commander@herdr-commander
+```
+
+安裝版是 Claude Code 複製到 `~/.claude/plugins/cache/herdr-commander/herdr-commander/<版本>/` 的那一份（整個 repo，含 `bridge/`、`codex/`）。
+
+### 開發時
+
+改 working copy 不用重裝：`claude --plugin-dir 'D:\tool\HerdrCommander'` 會用這一份，並蓋過同名的安裝版。從這一份開出來的 Claude worker 也會帶同樣的 `--plugin-dir`；安裝版開的 worker 則用一般的 `claude`。
+
+注意：在這個資料夾裡用 `--plugin-dir` 指向它自己，Claude Code 會跳資料夾信任對話框（`D:/Tool/HerdrCommander` 本身沒被信任，平常靠上層的 `D:/Tool` 涵蓋）。要嘛自己按信任一次，要嘛換個 cwd 啟動（10-05 的實測是從 `D:\Tool` 啟動的）。
+
+## 執行期資料與隔離
+
+執行期資料（jobs、results、tasks、bg、lease、owned）放在 `%LOCALAPPDATA%\herdr-commander\runtime\<workspace>\`，不在 plugin 資料夾裡。所以更新不會清掉它，安裝版、開發版、Codex 啟動器也共用同一份。`HERDR_BRIDGE_RUNTIME` 可以改這個位置（測試用）。
+
+- Claude：plugin 裝在使用者層級，但 herdr 外什麼都不做。
+- Codex：只有用 `herdr-codex.ps1` 或 bridge 開出來的那個 Codex 會生效，全部用 `codex -c` 覆寫帶入；一般的 `codex` 不受影響，也不寫 `~/.codex/*`。
 
 ## 使用
 
 ### Claude 當 commander
 
-在 herdr 的 pane 裡：
-
-```powershell
-claude --plugin-dir 'D:\tool\HerdrCommander\claude-mod'
-```
-
-然後輸入 `/commander`。會取得這個 workspace 的 commander lease、打開 Commander 面板，並擋掉自己的 Write／Edit／NotebookEdit。`/commander off` 結束。
+在 herdr 的 pane 裡啟動 `claude`（裝好 plugin 後直接啟動；開發時用 `claude --plugin-dir 'D:\tool\HerdrCommander'`），然後輸入 `/commander`。會取得這個 workspace 的 commander lease、打開 Commander 面板，並擋掉自己的 Write／Edit／NotebookEdit。`/commander off` 結束。
 
 面板內容：各 agent 的狀態燈號、kind、持續時間、title（依 workspace 分組，blocked 排最前）、選中 agent 的最近輸出、自己派出去的 jobs。
 
@@ -44,7 +63,7 @@ commander 會以 `-s read-only` 啟動，`-WithDashboard` 會在下方開一個 
 
 ### 一個 workspace 一個 commander
 
-Claude 與 Codex 共用同一份 lease（`.runtime/<workspace>/lease.json`）。另一個 pane 還活著時，第二個 commander 會被拒；持有者的 pane 消失就自動讓出。
+Claude 與 Codex 共用同一份 lease（`<runtime>/<workspace>/lease.json`）。另一個 pane 還活著時，第二個 commander 會被拒；持有者的 pane 消失就自動讓出。
 
 ## 功能開關（userConfig）
 
@@ -60,14 +79,14 @@ Claude 與 Codex 共用同一份 lease（`.runtime/<workspace>/lease.json`）。
 | `deliverFlow` | **關**（P4） | herdr 內展開 `/deliver` skill 時附上 herdr pane 版流程 |
 | `pollSeconds` | 3 | 輪詢間隔（一次 herdr 呼叫約 1.2 秒） |
 
-`--plugin-dir` 載入的 plugin 從 `settings.json` 的 `pluginConfigs["herdr-commander"].options` 讀值。依隔離原則我沒有寫入；要開 P2 之後的功能，由你決定要不要加。
+開關的值從 `settings.json` 的 `pluginConfigs` 讀取（安裝版也可以在 `/plugin` 的設定選單裡改）。P2 之後的功能要不要開，由你決定。
 
 ## 安全規則（都在 bridge）
 
 **這是護欄，不是沙箱。** 下列規則只約束經過 bridge／MCP 的呼叫。模型如果用 Bash 直接執行 `herdr ...`，或自己呼叫 `cli.mjs` 並加上 `--by-user`（這個旗標沒有驗證身分），都能繞過。commander 擋 Write／Edit 也一樣，shell 仍然可以寫檔。
 
 - 禁止透過 bridge 執行：`server stop`、`server live-handoff`、`session stop/delete`、`workspace close`、`tab close`、`worktree remove`、`integration install/uninstall`、`plugin install/uninstall`。
-- `pane close` 只限 bridge 自己開的 pane（`.runtime/<ws>/owned.json`）。
+- `pane close` 只限 bridge 自己開的 pane（`<runtime>/<ws>/owned.json`）。
 - worker 一律不能再開 worker（防遞迴）：bridge 開的 pane 都帶 `HERDR_COMMANDER_ROLE=worker`。
 - 經過 bridge 的模型呼叫只能中斷自己派工或自己開的 pane；面板按鈕（你按的，帶 `--by-user`）可以中斷任何非自己的 pane。Claude 端呼叫 `herdr_job_interrupt` 一律跳權限詢問（D1）。
 - job 完成只認兩種證據：受派者本人呼叫 `herdr_job_complete`（帶 `result` 全文，由 bridge 寫成結果檔），或結果檔帶檔頭 `job_id: <id>`。agent 的 idle／done／unknown 一律不算完成；送達失敗記為 `delivery_unknown`，不自動重送。
@@ -78,11 +97,11 @@ Claude 與 Codex 共用同一份 lease（`.runtime/<workspace>/lease.json`）。
 ## 測試
 
 ```powershell
-cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 26 項，假 herdr，不碰實機
-cd ..\claude-mod; claude plugin validate .; claude plugin test .                  # 17 項
+cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 28 項，假 herdr，不碰實機
+cd ..; claude plugin validate .; claude plugin test .                            # 17 項；validate 也會檢查 marketplace.json
 ```
 
-型別檢查：mod 被載入一次後，引擎會在 `claude-mod/.claude-plugin/types/` 放 `tsconfig.json`。本機沒有 TypeScript 5.4+ 的 `tsc`，我是用 VS Code 內附的 TypeScript 5.6（`typescript.js` API）跑同一份 tsconfig，結果 0 錯誤。
+型別檢查：mod 被載入一次後，引擎會在 `.claude-plugin/types/` 放 `tsconfig.json`。本機沒有 TypeScript 5.4+ 的 `tsc`，我是用 VS Code 內附的 TypeScript 5.6（`typescript.js` API）跑同一份 tsconfig，結果 0 錯誤。
 
 ## P0 spike 結果
 
@@ -142,11 +161,11 @@ cd ..\claude-mod; claude plugin validate .; claude plugin test .                
 - 每次 herdr 呼叫約 1.2 秒；commander 模式下輪詢與預覽會持續有 node 行程。
 - `agent read` 讀不到 alternate screen 已捲走的內容，所以結果一律走檔案。
 - SendMessage 改走 herdr 時，對方收到的是一個 job（kind=question），要寫結果檔才算回覆。
-- `.runtime/<ws>/owned.json` 若 pane 是被手動關閉的，會留下過期項目（不影響功能）。
+- `<runtime>/<ws>/owned.json` 若 pane 是被手動關閉的，會留下過期項目（不影響功能）。
 - D4（Codex 的 herdr integration）仍待你決定；目前 Codex 狀態靠 herdr 讀畫面。
 
 ## 給 review 的重點
 
 - `bridge/lib/ops.mjs`：所有 herdr 操作與規則（禁止清單在 `lib/herdr.mjs`）。
-- `claude-mod/hooks/register.tsx`：所有用到 `$` 的程式。引擎規定 `$` 不能跨 import 傳遞、state atom 必須宣告在同一檔，所以集中在這裡；純函式在 `hooks/pure.ts`。
+- `hooks/register.tsx`：所有用到 `$` 的程式。引擎規定 `$` 不能跨 import 傳遞、state atom 必須宣告在同一檔，所以集中在這裡；純函式在 `hooks/pure.ts`。
 - `codex/herdr-codex.ps1` → `bridge/cli.mjs codex-launch`：Codex 的參數交給 node 去 quote，因為 PowerShell 5.1 會弄壞含引號的 native 參數。

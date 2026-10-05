@@ -6,7 +6,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { runJson, runText } from './herdr.mjs'
-import { BridgeError, CLI_PATH, CODEX_DIR, MCP_PATH, MOD_DIR, runtimeRoot } from './paths.mjs'
+import { BridgeError, CLI_PATH, CODEX_DIR, MCP_PATH, TOOL_ROOT, isInstalledCopy, runtimeRoot } from './paths.mjs'
 import { Store, newId } from './store.mjs'
 
 export const SOURCE = 'herdr-commander'
@@ -460,6 +460,15 @@ function workerName(name, kind) {
   return NAME.test(candidate) ? candidate : `worker-${Math.random().toString(36).slice(2, 6)}`
 }
 
+/**
+ * The command that starts a Claude worker with this same plugin: the installed
+ * copy loads by itself; a working copy goes by --plugin-dir, which also takes
+ * precedence over an installed copy of the same name.
+ */
+export function claudeLine(root = TOOL_ROOT) {
+  return isInstalledCopy(root) ? 'claude' : `claude --plugin-dir '${root}'`
+}
+
 export async function spawn(ctx, { kind = 'claude', name, cwd, task, direction = 'right' }) {
   requireFrom(ctx)
   const ws = requireWorkspace(ctx)
@@ -496,7 +505,7 @@ export async function spawn(ctx, { kind = 'claude', name, cwd, task, direction =
   // The pane shell is PowerShell 5.1, which mangles embedded quotes in native
   // arguments; so the command line typed there carries no quoted payload.
   const line = kind === 'claude'
-    ? `claude --plugin-dir '${MOD_DIR}'`
+    ? claudeLine()
     : `& '${process.execPath}' '${CLI_PATH}' codex-launch b64:${Buffer.from(JSON.stringify({ role: 'worker', pane: paneId, workspace: ws })).toString('base64')}`
   await runJson(['pane', 'run', paneId, line])
   const detected = await waitForAgent(paneId, kind, 90000)

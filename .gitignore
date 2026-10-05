@@ -1,6 +1,6 @@
-# runtime data written by herdr-bridge (jobs, results, task files, lease, owned panes)
+# runtime data from before it moved to %LOCALAPPDATA%\herdr-commanderuntime
 .runtime/
 # laid by the Claude Code engine each time it loads the mod
-claude-mod/.claude-plugin/types/
+.claude-plugin/types/
 # crash dumps from Git Bash
 *.stackdump

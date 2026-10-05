@@ -44,6 +44,7 @@ const ops = await import('../lib/ops.mjs')
 const { isForbidden } = await import('../lib/herdr.mjs')
 const { Store } = await import('../lib/store.mjs')
 const { toolsFor } = await import('../lib/registry.mjs')
+const { runtimeRoot } = await import('../lib/paths.mjs')
 
 const me = { from: 'wA:p1', workspace: 'wA', role: 'plain', byUser: false }
 
@@ -251,8 +252,28 @@ test('spawn opens a worker pane with the worker role and starts the agent', asyn
   assert.ok(split.includes('HERDR_COMMANDER_ROLE=worker'))
   assert.ok(split.includes('--no-focus'))
   const run = calls().find(args => args[0] === 'pane' && args[1] === 'run')
-  assert.match(run[3], /claude --plugin-dir '.*claude-mod'/)
+  assert.equal(run[3], ops.claudeLine())
   assert.equal(new Store('wA').isOwned('wA:p9'), true)
+})
+
+test('a working copy starts Claude workers by --plugin-dir; the installed copy by plain claude', () => {
+  assert.equal(ops.claudeLine('D:\\Tool\\HerdrCommander'), "claude --plugin-dir 'D:\\Tool\\HerdrCommander'")
+  assert.equal(ops.claudeLine('C:\\Users\\me\\.claude\\plugins\\cache\\herdr-commander\\herdr-commander\\0.1.0'), 'claude')
+  assert.equal(ops.claudeLine('/home/me/.claude/plugins/cache/m/p/0.1.0'), 'claude')
+})
+
+test('runtime data lives outside the plugin, under LOCALAPPDATA, unless overridden', () => {
+  const saved = { runtime: process.env.HERDR_BRIDGE_RUNTIME, local: process.env.LOCALAPPDATA }
+  try {
+    delete process.env.HERDR_BRIDGE_RUNTIME
+    process.env.LOCALAPPDATA = 'C:\\Users\\me\\AppData\\Local'
+    assert.equal(runtimeRoot(), join('C:\\Users\\me\\AppData\\Local', 'herdr-commander', 'runtime'))
+    process.env.HERDR_BRIDGE_RUNTIME = 'D:\\elsewhere'
+    assert.equal(runtimeRoot(), 'D:\\elsewhere')
+  } finally {
+    process.env.HERDR_BRIDGE_RUNTIME = saved.runtime
+    process.env.LOCALAPPDATA = saved.local
+  }
 })
 
 test('a worker that comes up blocked (trust or login prompt) is not sent its task', async () => {

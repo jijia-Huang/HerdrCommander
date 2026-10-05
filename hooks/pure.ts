@@ -56,7 +56,7 @@ export function base64(text: string): string {
 }
 
 export function bridgeArgv(root: string, g: Gate, command: string, args: Record<string, unknown>, byUser: boolean): string[] {
-  const argv = ['node', `${root}/../bridge/cli.mjs`, command, `b64:${base64(JSON.stringify(args))}`, '--pane', g.paneId, '--workspace', g.workspaceId, '--role', g.role]
+  const argv = ['node', `${root}/bridge/cli.mjs`, command, `b64:${base64(JSON.stringify(args))}`, '--pane', g.paneId, '--workspace', g.workspaceId, '--role', g.role]
   if (byUser) {
     argv.push('--by-user')
   }

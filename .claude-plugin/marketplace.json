@@ -1,0 +1,16 @@
+{
+  "name": "herdr-commander",
+  "owner": {
+    "name": "jijiahuang"
+  },
+  "metadata": {
+    "description": "HerdrCommander: Claude Code and Codex working together inside herdr"
+  },
+  "plugins": [
+    {
+      "name": "herdr-commander",
+      "source": "./",
+      "description": "Inside herdr: commander pane, herdr-backed lifecycle, notifications and cross-agent jobs via herdr-bridge; outside herdr it does nothing"
+    }
+  ]
+}

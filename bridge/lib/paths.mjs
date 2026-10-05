@@ -1,18 +1,31 @@
-// Every path the bridge touches lives under Tools/HerdrCommander (project isolation).
+// The bridge's own files sit inside the plugin (the repo root, or its copy in
+// Claude Code's plugin cache); runtime data lives outside it so a plugin update
+// keeps it and every copy (installed, --plugin-dir, the Codex launcher) shares it.
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const BRIDGE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const TOOL_ROOT = resolve(BRIDGE_DIR, '..')
-export const MOD_DIR = join(TOOL_ROOT, 'claude-mod')
 export const CODEX_DIR = join(TOOL_ROOT, 'codex')
 export const CLI_PATH = join(BRIDGE_DIR, 'cli.mjs')
 export const MCP_PATH = join(BRIDGE_DIR, 'mcp.mjs')
 export const DASHBOARD_PATH = join(BRIDGE_DIR, 'dashboard.mjs')
 
-/** Runtime data root; HERDR_BRIDGE_RUNTIME overrides it (tests). */
+/** Runtime data root: %LOCALAPPDATA%\herdr-commander\runtime; HERDR_BRIDGE_RUNTIME overrides it (tests). */
 export function runtimeRoot() {
-  return process.env.HERDR_BRIDGE_RUNTIME || join(TOOL_ROOT, '.runtime')
+  if (process.env.HERDR_BRIDGE_RUNTIME) {
+    return process.env.HERDR_BRIDGE_RUNTIME
+  }
+  return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'herdr-commander', 'runtime')
+}
+
+/**
+ * True when this copy is the one Claude Code installed (in its plugin cache):
+ * a plain `claude` then loads it, while a working copy is passed by --plugin-dir.
+ */
+export function isInstalledCopy(root = TOOL_ROOT) {
+  return /[\\/]plugins[\\/]cache[\\/]/i.test(root)
 }
 
 /** One workspace's folder: jobs/, results/, bg/, lease.json, owned.json. */
