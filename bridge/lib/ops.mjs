@@ -2,11 +2,11 @@
 //   { from: caller pane id, workspace: caller workspace id, role, byUser }
 // `byUser` is set only by the Claude mod's panel buttons (a person pressed
 // them); model-driven calls (MCP, the mod's tools) never set it.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { runJson, runText } from './herdr.mjs'
-import { BridgeError, CLI_PATH, CODEX_DIR, MCP_PATH, MOD_DIR } from './paths.mjs'
+import { BridgeError, CLI_PATH, CODEX_DIR, MCP_PATH, MOD_DIR, runtimeRoot } from './paths.mjs'
 import { Store, newId } from './store.mjs'
 
 export const SOURCE = 'herdr-commander'
@@ -39,6 +39,34 @@ function storeFor(workspaceId) {
   return new Store(workspaceId)
 }
 
+/** Workspaces that have runtime data (job senders among them). */
+function runtimeWorkspaces() {
+  try {
+    return readdirSync(runtimeRoot(), { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^[A-Za-z0-9_-]+$/.test(entry.name))
+      .map(entry => entry.name)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The store that holds a job. A job lives in its sender's workspace, so a
+ * worker in another workspace finds it by id; the assignee check still applies.
+ */
+function storeOfJob(preferred, jobId) {
+  const own = storeFor(preferred)
+  if (own.getJob(jobId)) {
+    return own
+  }
+  for (const ws of runtimeWorkspaces()) {
+    if (ws !== preferred && storeFor(ws).getJob(jobId)) {
+      return storeFor(ws)
+    }
+  }
+  return own
+}
+
 /** Agents plus what the bridge knows about each: role, current job, owned. */
 export async function listAgents(ctx = {}) {
   const agents = await rawAgents()
@@ -46,11 +74,13 @@ export async function listAgents(ctx = {}) {
   const info = new Map()
   for (const ws of workspaces) {
     const store = storeFor(ws)
-    info.set(ws, { lease: store.getLease(), jobs: store.listJobs(), owned: store.getOwned() })
+    info.set(ws, { lease: store.getLease(), owned: store.getOwned() })
   }
+  // A job sits in its sender's workspace, which may not be the worker's.
+  const active = runtimeWorkspaces().flatMap(ws => storeFor(ws).listJobs()).filter(one => ACTIVE_JOB.has(one.status))
   return agents.map(agent => {
-    const { lease, jobs, owned } = info.get(agent.workspace_id) ?? { lease: null, jobs: [], owned: [] }
-    const job = jobs.find(one => one.to === agent.pane_id && ACTIVE_JOB.has(one.status)) ?? null
+    const { lease, owned } = info.get(agent.workspace_id) ?? { lease: null, owned: [] }
+    const job = active.find(one => one.to === agent.pane_id) ?? null
     const own = owned.find(one => one.pane_id === agent.pane_id) ?? null
     return {
       ...agent,
@@ -318,7 +348,7 @@ export async function jobGet(ctx, { job_id: jobId, limit = 20 } = {}) {
 }
 
 export async function jobComplete(ctx, { job_id: jobId, summary = '', result, result_path: resultPath }) {
-  const store = storeFor(requireWorkspace(ctx))
+  const store = storeOfJob(requireWorkspace(ctx), String(jobId))
   const job = store.getJob(String(jobId))
   if (!job) {
     throw new BridgeError('no_job', `no job ${jobId}`)

@@ -78,7 +78,7 @@ Claude 與 Codex 共用同一份 lease（`.runtime/<workspace>/lease.json`）。
 ## 測試
 
 ```powershell
-cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 25 項，假 herdr，不碰實機
+cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 26 項，假 herdr，不碰實機
 cd ..\claude-mod; claude plugin validate .; claude plugin test .                  # 17 項
 ```
 
@@ -129,6 +129,7 @@ cd ..\claude-mod; claude plugin validate .; claude plugin test .                
 9. Codex commander 結束後 shell pane 還在，lease 會卡住 → lease 存活改成「pane 裡還有同 kind 的 agent」，Codex 結束時 `codex-launch` 也會主動釋放；MCP 的 claim 記成 kind `codex`。
 10. worker 開起來卡在資料夾信任對話框時，bridge 仍把任務打進去（等於在對話框上打字）→ 開起來是 blocked 就不送任務並回報。
 11. （2026-10-05）任務檔是無 BOM 的 UTF-8，Codex worker 用 PowerShell 5.1 的 `Get-Content` 讀會以 Big5 解碼成亂碼（超過一行 prompt 預覽 160 字的中文任務就看不到）→ 任務檔改成帶 BOM 寫入。
+12. （2026-10-05，Codex review）跨 workspace 派工時，job 存在派工者的 workspace，但 `herdr_job_complete` 只查回報者自己的 workspace → 回 `no_job`，commander 一直看到 `sent` → 改成用 job ID 跨 workspace 找 job（assignee 檢查不變），`listAgents` 的「目前 job」也跨 workspace 找。
 
 ## 已知限制與未做項目
 

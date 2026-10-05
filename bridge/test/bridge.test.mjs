@@ -144,6 +144,24 @@ test('job-complete checks the assignee and the result file', async () => {
   assert.equal(out.job.summary, 'done it')
 })
 
+test('a worker in another workspace completes a job kept in the sender workspace', async () => {
+  arrange({ agents: [...AGENTS,
+    { pane_id: 'wB:p1', agent: 'codex', agent_status: 'idle', terminal_title_stripped: 'far', cwd: 'D:\\y', workspace_id: 'wB', tab_id: 'wB:t1' },
+    { pane_id: 'wB:p2', agent: 'codex', agent_status: 'idle', terminal_title_stripped: 'near', cwd: 'D:\\y', workspace_id: 'wB', tab_id: 'wB:t1' },
+  ] })
+  const { job } = await ops.send(me, { target: 'wB:p1', body: 'tidy the docs' })
+  assert.equal(job.workspace_id, 'wA')
+  const row = (await ops.listAgents(me)).find(one => one.pane_id === 'wB:p1')
+  assert.equal(row.job_id, job.job_id)
+  const neighbour = { from: 'wB:p2', workspace: 'wB', role: 'plain', byUser: false }
+  await assert.rejects(ops.jobComplete(neighbour, { job_id: job.job_id, summary: 's', result: 'x' }), /not wB:p2/)
+  const worker = { from: 'wB:p1', workspace: 'wB', role: 'plain', byUser: false }
+  const out = await ops.jobComplete(worker, { job_id: job.job_id, summary: 'done', result: 'docs tidied' })
+  assert.equal(out.job.status, 'completed')
+  assert.equal((await ops.jobGet(me, { job_id: job.job_id })).job.status, 'completed')
+  assert.match(readFileSync(job.result_path, 'utf8'), /docs tidied/)
+})
+
 test('an idle codex commander is woken on completion; a claude commander is not', async () => {
   for (const kind of ['codex', 'claude']) {
     writeFileSync(logPath, '')
