@@ -2,7 +2,8 @@
 // and a record of what the mod asked the engine to do.
 import type { On, RenderElement, RenderNode } from 'claude-code'
 
-export type BridgeCall = { command: string; args: Record<string, unknown>; flags: string[] }
+/** `args` holds the command-line args and, merged in, any that came on stdin (`stdin` lists their keys). */
+export type BridgeCall = { command: string; args: Record<string, unknown>; flags: string[]; argv: string[]; stdin: string[] }
 
 export type World = {
   bridge: BridgeCall[]
@@ -76,8 +77,9 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
     const argv = e.argv
     const command = argv[2] ?? ''
     const payload = argv[3] ?? ''
-    const args = payload.startsWith('b64:') ? (JSON.parse(fromBase64(payload.slice(4))) as Record<string, unknown>) : {}
-    const call: BridgeCall = { command, args, flags: argv.slice(4) }
+    const fromArgv = payload.startsWith('b64:') ? (JSON.parse(fromBase64(payload.slice(4))) as Record<string, unknown>) : {}
+    const fromStdin = argv.includes('--args-stdin') && e.init?.stdin ? (JSON.parse(e.init.stdin) as Record<string, unknown>) : {}
+    const call: BridgeCall = { command, args: { ...fromArgv, ...fromStdin }, flags: argv.slice(4), argv: [...argv], stdin: Object.keys(fromStdin) }
     world.bridge.push(call)
     const failure = world.failures[command]
     const reply = world.replies[command]

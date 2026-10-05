@@ -37,7 +37,7 @@ export type JobEvent = {
   message_seq?: number
   note?: string
   by?: string
-  /** How a job completed: message (sent, then stopped), tool or result_file. */
+  /** How a job completed: answer (a Claude worker's final reply), tool, result_file, or message (before 0.2.2). */
   via?: string
 }
 

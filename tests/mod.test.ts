@@ -82,7 +82,7 @@ describe('inside herdr', () => {
     expect(sections[1]?.text).toContain('herdr-commander:claude-worker')
   })
 
-  test('a worker pane gets no command, no tool, no agent types, and is told to answer with SendMessage to main', async ($, on) => {
+  test('a worker pane gets no command, no tool, no agent types, and is told its final reply is the result', async ($, on) => {
     const world = worldOf(on, { ...HERDR_ENV, HERDR_COMMANDER_ROLE: 'worker' })
     mock.clock(on)
     on('prompt.compose', () => COMPOSED)
@@ -93,7 +93,9 @@ describe('inside herdr', () => {
     expect(world.agentTypes).toEqual([])
     const env = (await $.prompt.compose(COMPOSE_INPUT)).sections.find(section => section.id === 'herdr-commander:env')
     expect(env?.text).toContain('WORKER')
-    expect(env?.text).toContain('SendMessage to "main"')
+    expect(env?.text).toContain('your final reply goes to whoever gave you the work')
+    expect(env?.text).toContain('you may also SendMessage to "main" (optional)')
+    expect(env?.text).not.toContain('a message sent and then stopping completes the job')
     expect(env?.text).toContain('given to you directly')
     expect(env?.text).not.toContain('herdr_job_complete')
   })
@@ -238,7 +240,8 @@ describe('Agent, SendMessage, TaskStop through herdr', () => {
     await $.session.start(SESSION)
     const ran = await $.tool.call(CALLS.send as never)
     expect(ran.result).toEqual({ success: true, message: 'Message sent to wA:p9.' })
-    expect((ran.context ?? []).join('\n')).toContain('end your turn now')
+    expect((ran.context ?? []).join('\n')).toContain('a report along the way')
+    expect((ran.context ?? []).join('\n')).toContain('your final reply when this turn ends')
     expect(world.bridge.find(call => call.command === 'route')?.args).toEqual({ to: 'main', text: 'done: 3 files' })
   })
 
@@ -316,14 +319,21 @@ describe('Read, background commands and turns', () => {
     expect(world.bridge.some(call => !['report-session', 'report'].includes(call.command))).toBe(false)
   })
 
-  test('the end of a main-loop turn is reported to the bridge (it decides about jobs)', async ($, on) => {
+  test('the end of a main-loop turn goes to the bridge with its reason and answer, the answer on stdin (it decides about jobs)', async ($, on) => {
     const world = worldOf(on, { ...HERDR_ENV, HERDR_COMMANDER_ROLE: 'worker' })
     const clock = mock.clock(on)
     on('turn.complete', () => ({ text: '' }))
     await $.session.start(SESSION)
-    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    const long = `Result:\n${'長'.repeat(40000)}`
+    await $.turn.complete({ answer: long, durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as never)
     await clock.advance(10)
-    expect(world.bridge.some(call => call.command === 'turn-end')).toBe(true)
+    const ended = world.bridge.find(call => call.command === 'turn-end')
+    expect(ended?.args).toMatchObject({ reason: 'answer', aborted: false, answer: long })
+    expect(ended?.stdin).toEqual(['answer'])
+    expect(ended?.argv.join(' ').length).toBeLessThan(2000)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't1b', reason: 'aborted' } as never)
+    await clock.advance(10)
+    expect(world.bridge.filter(call => call.command === 'turn-end').at(-1)?.args).toMatchObject({ reason: 'aborted', aborted: true, answer: '' })
     const before = world.bridge.filter(call => call.command === 'turn-end').length
     await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't2', agentId: 'sub', reason: 'answer' } as never)
     await clock.advance(10)
@@ -365,19 +375,35 @@ describe('pure helpers', () => {
     expect(transitions(before, after, 'wA:p1').map(one => [one.row.paneId, one.isBlocked])).toEqual([['wA:p2', true], ['wD:p2', false]])
   })
 
-  test('job events wake once each: a worker message whole, then completed', () => {
+  test('job events wake once each: stopped without a result, a message along the way, then completed with the final reply in the same notice', () => {
     const worker: WorkerRow = { herdrId: 'herdr-agent-wA-abc123', kind: 'claude', name: 'impl', agentName: null, paneId: 'wA:p9', status: 'running', cwd: 'D:\\w', outputFile: 'C:/rt/out.md', note: '', jobId: 'job-1', queued: 0 }
     const job: JobRow = {
       jobId: 'job-1', from: 'wA:p1', to: 'wA:p9', worker: worker.herdrId, kind: 'task', status: 'completed', summary: 'done', body: 'x', resultPath: 'r.md',
-      messages: [{ seq: 2, from: 'worker', text: 'Result: all 3 tests pass' }],
-      events: [{ seq: 1, type: 'stopped_without_message', at: 't' }, { seq: 3, type: 'message', at: 't', message_seq: 2 }, { seq: 4, type: 'completed', at: 't', via: 'message' }],
+      messages: [{ seq: 2, from: 'worker', text: 'Halfway: 2 of 3 done' }, { seq: 4, from: 'worker', text: 'Result: all 3 tests pass' }],
+      events: [{ seq: 1, type: 'stopped_without_answer', at: 't' }, { seq: 3, type: 'message', at: 't', message_seq: 2 }, { seq: 5, type: 'completed', at: 't', via: 'answer', message_seq: 4 }],
     }
     const theirs: JobRow = { ...job, jobId: 'job-2', from: 'wA:p5' }
     const first = notices('wA:p1', [job, theirs], [worker], [])
-    expect(first.keys).toEqual(['job-1#1', 'job-1#3', 'job-1#4'])
-    expect(first.lines[1]).toContain('Result: all 3 tests pass')
-    expect(first.lines[2]).toContain('SendMessage to herdr-agent-wA-abc123 continues the same job')
+    expect(first.keys).toEqual(['job-1#1', 'job-1#3', 'job-1#5'])
+    expect(first.lines[0]).toContain('stopped without handing you a result')
+    expect(first.lines[1]).toContain('Halfway: 2 of 3 done')
+    expect(first.lines[2]).toContain('finished job job-1. Its final reply:\nResult: all 3 tests pass')
+    expect(first.lines[2]).not.toContain('Halfway')
+    expect(first.lines[2]).toContain('SendMessage to herdr-agent-wA-abc123 continues the same job; TaskStop herdr-agent-wA-abc123 closes its pane.')
     expect(notices('wA:p1', [job], [worker], first.keys)).toEqual({ keys: [], lines: [] })
+  })
+
+  test('a final reply too long for a notice is cut and points to the worker\'s output file', () => {
+    const worker: WorkerRow = { herdrId: 'herdr-agent-wA-abc123', kind: 'claude', name: null, agentName: null, paneId: 'wA:p9', status: 'running', cwd: 'D:\\w', outputFile: 'C:/rt/out.md', note: '', jobId: null, queued: 0 }
+    const job: JobRow = {
+      jobId: 'job-1', from: 'wA:p1', to: 'wA:p9', worker: worker.herdrId, kind: 'task', status: 'completed', summary: '', body: 'x', resultPath: 'r.md',
+      messages: [{ seq: 1, from: 'worker', text: 'x'.repeat(9000) }],
+      events: [{ seq: 2, type: 'completed', at: 't', via: 'answer', message_seq: 1 }],
+    }
+    const { lines } = notices('wA:p1', [job], [worker], [])
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('[… cut; the whole text is in C:/rt/out.md]')
+    expect((lines[0] ?? '').length).toBeLessThan(6500)
   })
 
   test('the herdr listing says when there is nothing', () => {

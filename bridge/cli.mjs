@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-// herdr-bridge CLI: node cli.mjs <command> [json | b64:<base64 json>] [--pane P] [--workspace W] [--role R] [--by-user]
+// herdr-bridge CLI: node cli.mjs <command> [json | b64:<base64 json>] [--pane P] [--workspace W] [--role R] [--by-user] [--args-stdin]
 // Prints one JSON line: { ok: true, result } or { ok: false, error: { code, message } }.
+// --args-stdin: a JSON object on stdin joins the args (for text too long for a
+// command line, which Windows caps at 32,767 characters).
 import { COMMANDS } from './lib/registry.mjs'
 
 function parse(argv) {
@@ -12,6 +14,7 @@ function parse(argv) {
     byUser: false,
   }
   let args = {}
+  let stdinArgs = false
   for (let i = 0; i < rest.length; i += 1) {
     const token = rest[i]
     if (token === '--pane') {
@@ -22,19 +25,35 @@ function parse(argv) {
       ctx.role = rest[++i] ?? 'plain'
     } else if (token === '--by-user') {
       ctx.byUser = true
+    } else if (token === '--args-stdin') {
+      stdinArgs = true
     } else if (token.startsWith('b64:')) {
       args = JSON.parse(Buffer.from(token.slice(4), 'base64').toString('utf8'))
     } else {
       args = JSON.parse(token)
     }
   }
-  return { command, ctx, args }
+  return { command, ctx, args, stdinArgs }
+}
+
+async function readStdin() {
+  const chunks = []
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
 }
 
 async function main() {
   let parsed
   try {
     parsed = parse(process.argv.slice(2))
+    if (parsed.stdinArgs) {
+      const text = await readStdin()
+      if (text.trim() !== '') {
+        parsed.args = { ...parsed.args, ...JSON.parse(text) }
+      }
+    }
   } catch (error) {
     return { ok: false, error: { code: 'bad_args', message: String(error.message ?? error) } }
   }

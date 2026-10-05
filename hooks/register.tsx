@@ -85,14 +85,18 @@ let sending = false
 let awaitingPermission = false
 /** When this pane's current turn began (ms), for the bridge's "stopped" check. */
 let turnStartedAt: number | null = null
+/** The last prompt this pane took (ms), one delivered into a running turn included. */
+let lastPromptAt: number | null = null
 /** The role whose herdr text this session's model has been given (prompt context; see prompt.submit). */
 let briefedRole: Role | null = null
 let runtimeRoot = ''
 let options: Options = readOptions({})
 
-async function bridge<T = unknown>($: EngineInterface, command: string, args: Record<string, unknown> = {}, byUser = false, timeoutMs = 30000): Promise<T> {
+/** Runs a bridge command; `stdinArgs` go on stdin (no command-line length limit). */
+async function bridge<T = unknown>($: EngineInterface, command: string, args: Record<string, unknown> = {}, byUser = false, timeoutMs = 30000, stdinArgs: Record<string, unknown> | null = null): Promise<T> {
   const g = await read($, stGate)
-  const ran = await $.process.run(bridgeArgv($.plugin.root, g, command, args, byUser), { timeoutMs })
+  const argv = bridgeArgv($.plugin.root, g, command, args, byUser, stdinArgs !== null)
+  const ran = await $.process.run(argv, stdinArgs === null ? { timeoutMs } : { timeoutMs, stdin: JSON.stringify(stdinArgs) })
   return parseReply<T>(ran.stdout, ran.stderr, ran.exitCode)
 }
 
@@ -498,9 +502,11 @@ export const register: Register = (on, rawOptions) => {
     if (!g.inHerdr) {
       return next(e)
     }
-    // A prompt delivered into a running turn does not start a turn.
+    // A prompt delivered into a running turn does not start a turn, but that
+    // turn has taken it (the bridge's check that a turn covered a job).
+    lastPromptAt = await $.clock.now()
     if (e.turnId === undefined) {
-      turnStartedAt = await $.clock.now()
+      turnStartedAt = lastPromptAt
     }
     if (options.lifecycleReport) {
       want($, 'working')
@@ -522,8 +528,16 @@ export const register: Register = (on, rawOptions) => {
         want($, 'idle')
       }
       if (options.takeover) {
-        const startedAt = turnStartedAt
-        later($, () => bridge($, 'turn-end', startedAt === null ? {} : { started_at: startedAt }))
+        // The final answer is the result of this pane's open job (the bridge
+        // decides). It goes on stdin: it can be longer than a command line.
+        const args = {
+          ...(turnStartedAt === null ? {} : { started_at: turnStartedAt }),
+          ...(lastPromptAt === null ? {} : { prompt_at: lastPromptAt }),
+          reason: e.reason,
+          aborted: e.isAborted,
+        }
+        const answer = e.answer
+        later($, () => bridge($, 'turn-end', args, false, 30000, { answer }))
       }
     }
     return done

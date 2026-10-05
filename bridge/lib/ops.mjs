@@ -211,8 +211,10 @@ function requireFrom(ctx) {
 //
 // Messages: `messages` holds what went either way after the task itself
 // ({ seq, from: 'sender' | 'worker', text, at, delivered }); `events` is what
-// the sender is told about ({ seq, type, at }): a worker message, completed,
-// stopped without a message, stopped, cancelled, start failed or blocked.
+// the sender is told about ({ seq, type, at }): a worker message sent along
+// the way, completed, stopped without an answer, stopped, cancelled, start
+// failed or blocked. A Claude worker's final answer is a message too, but
+// it arrives with `completed` (one notice), not as an event of its own.
 
 function now() {
   return new Date().toISOString()
@@ -244,14 +246,19 @@ function isClaude(kind) {
   return kind === 'claude'
 }
 
+/** Claude worker jobs complete by the final answer of a turn; these carry the result in messages. */
+function viaMessages(job) {
+  return job.completed_via === 'message' || job.completed_via === 'answer'
+}
+
 /** The full task, with how to hand the result back, as the worker reads it from a file. */
 export function jobTaskFile(job, followUps = []) {
   const extra = followUps.length === 0 ? [] : ['', '## More from the sender', '', ...followUps.map(one => one.text)]
   const finish = isClaude(job.to_kind)
     ? [
-        `When you have the result, or need a decision, send it with the SendMessage tool to "main": it reaches ${job.from}, who gave you this job.`,
-        'Put everything they need in that message: what you changed, the commands you ran with their output, anything unresolved.',
-        'Then end your turn. A message sent and then stopping completes the job; a reply from them continues this same job.',
+        `When you have the result, or need a decision, write it in your reply and end your turn: your final reply goes to ${job.from}, who gave you this job.`,
+        'Put everything they need in it: what you changed, the commands you ran with their output, anything unresolved.',
+        'A reply from them continues this same job. To report something along the way, you may also SendMessage to "main".',
       ]
     : [
         `Call the herdr_job_complete tool with job_id="${job.job_id}", a one-line \`summary\` and the full result as \`result\``,
@@ -289,7 +296,7 @@ function preview(text, size = 160) {
 export function jobPrompt(job) {
   const head = `[herdr-job ${job.job_id}] from ${job.from} (${job.kind}): ${preview(job.body)} -- Full task: ${job.task_path} .`
   if (isClaude(job.to_kind)) {
-    return `${head} When done, send the result with SendMessage to "main" and end your turn.`
+    return `${head} When done, write the result in your reply and end your turn: your final reply goes back to ${job.from}.`
   }
   return `${head} When done, call herdr_job_complete with job_id="${job.job_id}", a one-line summary and the full result text as "result". Without that tool, write the result to ${job.result_path} (first line "job_id: ${job.job_id}").`
 }
@@ -301,7 +308,7 @@ function messageFile(job, pending) {
 function messagePrompt(job, path, pending) {
   const head = `[herdr-job ${job.job_id}] more from ${job.from} on this same job: ${preview(pending.map(one => one.text).join(' '))} -- Full text: ${path} .`
   if (isClaude(job.to_kind)) {
-    return `${head} Answer with SendMessage to "main" and end your turn.`
+    return `${head} Answer in your reply and end your turn: your final reply goes back to ${job.from}.`
   }
   return `${head} When done, call herdr_job_complete with job_id="${job.job_id}" again (a summary and the full result as "result").`
 }
@@ -514,8 +521,8 @@ async function pump(target) {
 function keepResult(store, job) {
   const round = (job.reopened ?? 0) + 1
   const own = store.resultPath(job.job_id)
-  let next = { ...job, status: 'queued', queued_at: now(), result_path: own, replied_at: null, reminded_at: null, woken: null, reopened: round }
-  if (job.completed_via !== 'message' && job.result_path && existsSync(job.result_path)) {
+  let next = { ...job, status: 'queued', queued_at: now(), result_path: own, reminded_at: null, woken: null, reopened: round }
+  if (!viaMessages(job) && job.result_path && existsSync(job.result_path)) {
     const text = readFileSync(job.result_path, 'utf8').replace(/^\uFEFF?job_id:[^\n]*\n+/, '').trim()
     if (text !== '') {
       next = withMessage(next, 'worker', `(result of round ${round}, ${job.result_path})\n\n${text}`)
@@ -625,8 +632,9 @@ export async function send(ctx, { target, kind = 'task', body }) {
 /**
  * A SendMessage from a pane that has jobs: to "main" goes to the sender of its
  * open job (else of its latest job); to a sender's pane id or name goes to
- * that sender. Passed on whole, whatever it says, and recorded as "the worker
- * sent a message". `routed: false` when this pane has no such job.
+ * that sender. Passed on whole, whatever it says, as a report along the way:
+ * it does not complete the job (the final answer of the turn does).
+ * `routed: false` when this pane has no such job.
  */
 export async function reply(ctx, { to, text }) {
   requireFrom(ctx)
@@ -653,23 +661,36 @@ export async function reply(ctx, { to, text }) {
   const open = candidates.filter(({ job }) => OPEN_JOB.has(job.status))
   const hit = open.length > 0 ? latest(open, 'delivered_at') : latest(candidates, 'updated_at')
   const isOpen = OPEN_JOB.has(hit.job.status)
-  let job = withMessage(hit.job, 'worker', text)
-  job = { ...job, messages: job.messages.map(one => (one.seq === job.seq ? { ...one, delivered: true } : one)) }
-  if (isOpen) {
-    job.replied_at = now()
-  }
+  let job = withWorkerText(hit.job, text)
   job = withEvent(job, 'message', { message_seq: job.seq })
   hit.store.putJob(job)
   writeWorkerOutput(job.worker)
   return { routed: true, job_id: job.job_id, to: job.from, open: isOpen }
 }
 
+/** A worker's text, already passed on to the sender, as one of the job's messages. */
+function withWorkerText(job, text) {
+  const next = withMessage(job, 'worker', text)
+  return { ...next, messages: next.messages.map(one => (one.seq === next.seq ? { ...one, delivered: true } : one)) }
+}
+
 /**
- * The worker pane's turn ended (its own mod says so). With a message sent
- * since the last delivery, its open job completes; without one, the sender
- * is told once that it stopped without a message. Then the next queued job.
+ * The worker pane's main-loop turn ended (its own mod says so, with what the
+ * engine reports: `reason`, `aborted`, and the turn's final `answer`, which
+ * comes on stdin since it can be longer than a command line). For this pane's
+ * open job, when the turn covered it:
+ * - ended with an answer (reason "answer", not aborted, not empty): the answer
+ *   is the worker's message and the job completes; the sender gets one notice;
+ * - aborted, refused, errored or empty: the sender is told once that it
+ *   stopped without an answer; the job stays open.
+ * No open job (it completed, or the person typed in the worker's pane): nothing.
+ *
+ * A turn covers the job when the job's latest delivery came in as a prompt of
+ * that turn: `prompt_at` (the last prompt the turn took, a message delivered
+ * into the running turn included) or else `started_at` is not before it. A
+ * turn that began earlier and never took it says nothing about the job.
  */
-export async function turnEnd(ctx, { started_at: startedAt } = {}) {
+export async function turnEnd(ctx, { started_at: startedAt, prompt_at: promptAt, reason, aborted, answer } = {}) {
   requireFrom(ctx)
   const open = allJobs()
     .filter(({ job }) => job.to === ctx.from && OPEN_JOB.has(job.status))
@@ -679,15 +700,19 @@ export async function turnEnd(ctx, { started_at: startedAt } = {}) {
   }
   const { store } = open
   let job = open.job
-  if (job.replied_at && job.replied_at >= job.delivered_at) {
-    job = await finishJob(store, { ...job, completed_via: 'message' })
+  const at = typeof promptAt === 'number' ? promptAt : typeof startedAt === 'number' ? startedAt : null
+  const coversJob = at === null || new Date(at).toISOString() >= job.delivered_at
+  if (!coversJob) {
+    return { job }
+  }
+  const text = typeof answer === 'string' ? answer : ''
+  if (reason === 'answer' && aborted !== true && text.trim() !== '') {
+    job = withWorkerText(job, text)
+    job = await finishJob(store, { ...job, completed_via: 'answer', answer_seq: job.seq })
     return { job, completed: true }
   }
-  // A turn that began before the job arrived says nothing about the job.
-  const began = typeof startedAt === 'number' ? new Date(startedAt).toISOString() : null
-  const coversJob = began === null || began >= job.delivered_at
-  if (coversJob && !(job.reminded_at && job.reminded_at >= job.delivered_at)) {
-    job = withEvent({ ...job, reminded_at: now() }, 'stopped_without_message')
+  if (!(job.reminded_at && job.reminded_at >= job.delivered_at)) {
+    job = withEvent({ ...job, reminded_at: now() }, 'stopped_without_answer', { reason: typeof reason === 'string' ? reason : 'unknown' })
     store.putJob(job)
     return { job, reminded: true }
   }
@@ -702,13 +727,14 @@ async function finishJob(store, job) {
     return fresh
   }
   const done = { ...job, status: 'completed', completed_at: now() }
-  if (job.completed_via === 'message') {
+  if (viaMessages(job)) {
     const sent = (job.messages ?? []).filter(one => one.from === 'worker')
     const last = sent[sent.length - 1]
     done.summary = String(last?.text ?? '').split(/\r?\n/).find(line => line.trim() !== '')?.trim().slice(0, 200) ?? ''
     writeFileSync(job.result_path, `job_id: ${job.job_id}\n\n${sent.map(one => one.text).join('\n\n---\n\n')}\n`, 'utf8')
   }
-  const marked = withEvent(done, 'completed', { via: job.completed_via })
+  const marked = withEvent(done, 'completed', { via: job.completed_via, ...(job.answer_seq ? { message_seq: job.answer_seq } : {}) })
+  delete marked.answer_seq
   store.putJob(marked)
   const out = await onCompleted(store, marked)
   writeWorkerOutput(out.worker)
@@ -1183,7 +1209,7 @@ function writeWorkerOutput(herdrId, screen = null) {
     for (const one of job.messages ?? []) {
       lines.push('', `### ${stamp(one.at)} ${one.from === 'worker' ? 'worker → sender' : 'sender → worker'}`, '', one.text)
     }
-    if (job.status === 'completed' && job.completed_via !== 'message' && existsSync(job.result_path)) {
+    if (job.status === 'completed' && !viaMessages(job) && existsSync(job.result_path)) {
       lines.push('', `### Result (${job.result_path})`, '', readFileSync(job.result_path, 'utf8').slice(0, 20000))
     }
   }

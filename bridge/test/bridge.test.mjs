@@ -352,42 +352,109 @@ const worker = { from: 'wA:p2', workspace: 'wA', role: 'worker', byUser: false }
 const other = { from: 'wA:p3', workspace: 'wA', role: 'plain', byUser: false }
 const prompts = to => calls().filter(args => args[0] === 'agent' && args[1] === 'prompt' && args[2] === to)
 
-test('a claude pane that is not a worker gets the one-line note: answer with SendMessage to main; a codex worker keeps herdr_job_complete', async () => {
+test('a claude pane that is not a worker gets the one-line note: the final reply is the answer; a codex worker keeps herdr_job_complete', async () => {
   claudeWorker()
   const { job } = await ops.message(me, { to: 'wA:p2', text: 'list the files' })
   assert.equal(job.delivered_as, 'file')
-  assert.match(readFileSync(job.task_path, 'utf8'), /SendMessage tool to "main"/)
-  assert.match(prompts('wA:p2')[0][3], /^\[herdr-job .*SendMessage to "main"/)
-  assert.doesNotMatch(prompts('wA:p2')[0][3], /herdr_job_complete/)
+  assert.match(readFileSync(job.task_path, 'utf8'), /write it in your reply and end your turn: your final reply goes to wA:p1/)
+  assert.match(prompts('wA:p2')[0][3], /^\[herdr-job .*your final reply goes back to wA:p1/)
+  assert.doesNotMatch(prompts('wA:p2')[0][3], /herdr_job_complete|SendMessage/)
   arrange()
   const codex = await ops.message(me, { to: 'wA:p3', text: 'x' })
   assert.match(readFileSync(codex.job.task_path, 'utf8'), /herdr_job_complete/)
 })
 
-test('a message to main and then the end of the turn complete the job; a turn without a message only reminds once', async () => {
+const answered = (answer, extra = {}) => ({ reason: 'answer', aborted: false, answer, ...extra })
+const types = job => job.events.map(one => one.type)
+
+test('a turn that ends with an answer completes the job: one completed event that carries the answer, and it is the result', async () => {
   claudeWorker()
   const { job } = await ops.message(me, { to: 'wA:p2', text: 'do it' })
-  const quiet = await ops.turnEnd(worker, {})
-  assert.equal(quiet.reminded, true)
-  assert.equal(quiet.job.status, 'sent')
-  assert.equal(quiet.job.events.at(-1).type, 'stopped_without_message')
-  assert.equal((await ops.turnEnd(worker, {})).reminded, undefined, 'reminded once per delivery')
-  const routed = await ops.reply(worker, { to: 'main', text: 'Done: 3 files.\nfull detail' })
-  assert.deepEqual([routed.routed, routed.to, routed.job_id, routed.open], [true, 'wA:p1', job.job_id, true])
-  assert.equal(new Store('wA').getJob(job.job_id).status, 'sent', 'a message alone does not complete the job')
-  const done = await ops.turnEnd(worker, {})
+  const done = await ops.turnEnd(worker, answered('Done: 3 files.\nfull detail'))
   assert.equal(done.completed, true)
   assert.equal(done.job.status, 'completed')
+  assert.equal(done.job.completed_via, 'answer')
   assert.equal(done.job.summary, 'Done: 3 files.')
-  assert.deepEqual(done.job.events.map(one => one.type), ['stopped_without_message', 'message', 'completed'])
-  assert.match(readFileSync(job.result_path, 'utf8'), new RegExp(`^job_id: ${job.job_id}[\\s\\S]*full detail`))
+  assert.deepEqual(types(done.job), ['completed'], 'no separate message event')
+  const event = done.job.events[0]
+  assert.equal(event.via, 'answer')
+  assert.equal(done.job.messages.find(one => one.seq === event.message_seq).text, 'Done: 3 files.\nfull detail')
+  assert.match(readFileSync(job.result_path, 'utf8'), new RegExp(`^job_id: ${job.job_id}\\n\\nDone: 3 files.\\nfull detail\\n$`))
+  assert.equal((readFileSync(new Store('wA').getJob(job.job_id).result_path, 'utf8').match(/full detail/g) ?? []).length, 1)
 })
 
-test('a turn that began before the job arrived does not count as stopping without a message', async () => {
+test('an aborted, refused, errored or empty turn does not complete; the sender is reminded once', async () => {
+  claudeWorker()
+  const { job } = await ops.message(me, { to: 'wA:p2', text: 'do it' })
+  const aborted = await ops.turnEnd(worker, { reason: 'aborted', aborted: true, answer: 'half an answer' })
+  assert.equal(aborted.reminded, true)
+  assert.equal(aborted.job.status, 'sent')
+  assert.deepEqual(types(aborted.job), ['stopped_without_answer'])
+  assert.equal(aborted.job.events[0].reason, 'aborted')
+  for (const end of [{ reason: 'refusal', aborted: false, answer: 'no' }, { reason: 'error', aborted: false, answer: '' }, answered('   '), {}]) {
+    const out = await ops.turnEnd(worker, end)
+    assert.equal(out.reminded, undefined, 'reminded once per delivery')
+    assert.equal(out.completed, undefined)
+  }
+  const kept = new Store('wA').getJob(job.job_id)
+  assert.equal(kept.status, 'sent')
+  assert.deepEqual(types(kept), ['stopped_without_answer'])
+  assert.equal(kept.messages.length, 0, 'nothing from a turn without an answer is recorded')
+  // A later turn that does answer still completes it.
+  assert.equal((await ops.turnEnd(worker, answered('ok now'))).job.status, 'completed')
+})
+
+test('a turn that began before the job arrived, and never took it, neither completes nor reminds', async () => {
   claudeWorker()
   await ops.message(me, { to: 'wA:p2', text: 'do it' })
-  const out = await ops.turnEnd(worker, { started_at: Date.now() - 60000 })
+  const early = Date.now() - 60000
+  const out = await ops.turnEnd(worker, answered('about something else', { started_at: early, prompt_at: early }))
   assert.equal(out.reminded, undefined)
+  assert.equal(out.completed, undefined)
+  assert.equal(out.job.status, 'sent')
+  assert.deepEqual(types(out.job), [])
+})
+
+test('a follow-up delivered into the running turn: that turn took it, so its answer completes the job', async () => {
+  claudeWorker()
+  const startedAt = Date.now() - 1000
+  await ops.message(me, { to: 'wA:p2', text: 'step one' })
+  const { job } = await ops.message(me, { to: 'wA:p2', text: 'also step two' })
+  // Still waiting in the worker's input box: this turn has not taken it, so its end says nothing.
+  const waiting = await ops.turnEnd(worker, answered('step one done', { started_at: startedAt, prompt_at: startedAt }))
+  assert.deepEqual([waiting.job.status, waiting.completed, waiting.reminded], ['sent', undefined, undefined])
+  // The follow-up arrived after the turn began; the worker's mod saw it as a prompt of that turn.
+  const out = await ops.turnEnd(worker, answered('both steps done', { started_at: startedAt, prompt_at: Date.now() }))
+  assert.equal(out.job.status, 'completed')
+  assert.equal(out.job.job_id, job.job_id)
+})
+
+test('a turn with no open job (it completed, or the person typed in the worker pane) records nothing', async () => {
+  claudeWorker()
+  assert.deepEqual(await ops.turnEnd(worker, answered('the person asked me something')), { job: null })
+  const { job } = await ops.message(me, { to: 'wA:p2', text: 'do it' })
+  await ops.turnEnd(worker, answered('result'))
+  const before = new Store('wA').getJob(job.job_id)
+  assert.deepEqual(await ops.turnEnd(worker, answered('the person typed here after the job')), { job: null })
+  assert.deepEqual(await ops.turnEnd(worker, { reason: 'aborted', aborted: true, answer: '' }), { job: null })
+  const after = new Store('wA').getJob(job.job_id)
+  assert.deepEqual(after.events, before.events)
+  assert.deepEqual(after.messages, before.messages)
+})
+
+test('a SendMessage along the way reaches the sender at once; the end of the turn completes the job with the answer', async () => {
+  claudeWorker()
+  const { job } = await ops.message(me, { to: 'wA:p2', text: 'do it' })
+  const routed = await ops.reply(worker, { to: 'main', text: 'Halfway: 2 of 3 done' })
+  assert.deepEqual([routed.routed, routed.to, routed.job_id, routed.open], [true, 'wA:p1', job.job_id, true])
+  const mid = new Store('wA').getJob(job.job_id)
+  assert.equal(mid.status, 'sent', 'a message alone does not complete the job')
+  assert.deepEqual(types(mid), ['message'])
+  const done = await ops.turnEnd(worker, answered('All 3 done.'))
+  assert.equal(done.job.status, 'completed')
+  assert.deepEqual(types(done.job), ['message', 'completed'])
+  assert.equal(done.job.summary, 'All 3 done.')
+  assert.equal(done.job.messages.find(one => one.seq === done.job.events[1].message_seq).text, 'All 3 done.')
 })
 
 test('the sender writing again during the job joins that job and is delivered now', async () => {
@@ -401,21 +468,48 @@ test('the sender writing again during the job joins that job and is delivered no
   assert.equal(new Store('wA').listJobs().length, 1)
 })
 
-test('replying to a worker whose job completed reopens the same job', async () => {
+test('replying to a worker whose job completed reopens the same job; the next answer completes it again with one notice', async () => {
   claudeWorker()
   const { job } = await ops.message(me, { to: 'wA:p2', text: 'first' })
-  await ops.reply(worker, { to: 'main', text: 'answer' })
-  await ops.turnEnd(worker, {})
+  await ops.turnEnd(worker, answered('first answer'))
   assert.equal(existsSync(job.result_path), true)
   const reopened = await ops.message(me, { to: 'wA:p2', text: 'one more thing' })
   assert.equal(reopened.action, 'reopened')
   assert.equal(reopened.job.job_id, job.job_id)
   assert.equal(reopened.job.status, 'sent')
   assert.equal(existsSync(job.result_path), false, 'the old result file is cleared until it completes again')
-  assert.equal((await ops.turnEnd(worker, {})).reminded, true, 'needs a new message after the new delivery')
-  await ops.reply(worker, { to: 'wA:p1', text: 'second answer' })
-  assert.equal((await ops.turnEnd(worker, {})).job.status, 'completed')
+  assert.equal(reopened.job.messages.filter(one => one.from === 'worker').length, 1, 'the first answer is not copied in again')
+  const seen = reopened.job.events.length
+  const again = await ops.turnEnd(worker, answered('second answer'))
+  assert.equal(again.job.status, 'completed')
+  assert.deepEqual(types(again.job).slice(seen), ['completed'], 'one new event for the second round')
+  assert.equal(again.job.messages.find(one => one.seq === again.job.events.at(-1).message_seq).text, 'second answer')
+  assert.match(readFileSync(join(new Store('wA').resultsDir, `${job.job_id}.round1.md`), 'utf8'), /first answer/)
   assert.equal(new Store('wA').listJobs().length, 1)
+})
+
+test('an answer longer than a command line reaches the bridge whole on stdin', async () => {
+  claudeWorker()
+  const { job } = await ops.message(me, { to: 'wA:p2', text: 'do it' })
+  const answer = `Result:\n${'結果'.repeat(20000)}\nEND`
+  assert.ok(answer.length > 32767)
+  const env = { ...process.env }
+  for (const key of ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_WORKSPACE_ID', 'HERDR_COMMANDER_ROLE']) {
+    delete env[key]
+  }
+  const args = `b64:${Buffer.from(JSON.stringify({ reason: 'answer', aborted: false })).toString('base64')}`
+  const child = spawn(process.execPath, [join(here, '..', 'cli.mjs'), 'turn-end', args, '--pane', 'wA:p2', '--workspace', 'wA', '--role', 'worker', '--args-stdin'], { env })
+  let stdout = ''
+  child.stdout.on('data', chunk => {
+    stdout += chunk
+  })
+  child.stdin.end(JSON.stringify({ answer }))
+  await new Promise(done => child.on('exit', done))
+  const reply = JSON.parse(stdout.trim().split('\n').pop())
+  assert.equal(reply.ok, true, stdout)
+  assert.equal(reply.result.completed, true)
+  const text = readFileSync(job.result_path, 'utf8')
+  assert.equal(text, `job_id: ${job.job_id}\n\n${answer}\n`)
 })
 
 test('a worker busy with another sender\'s job queues the new job and gets it when the first completes', async () => {
@@ -429,7 +523,8 @@ test('a worker busy with another sender\'s job queues the new job and gets it wh
   assert.equal(listed.job_id, mine.job.job_id, 'the open job, not the queued one')
   // "main" goes to the sender of the open job.
   assert.equal((await ops.reply(worker, { to: 'main', text: 'for p1' })).to, 'wA:p1')
-  await ops.turnEnd(worker, {})
+  await ops.turnEnd(worker, answered('p1 done'))
+  assert.equal(new Store('wA').getJob(mine.job.job_id).status, 'completed')
   assert.equal(new Store('wA').getJob(theirs.job.job_id).status, 'sent')
   assert.equal(prompts('wA:p2').length, 2)
   assert.equal((await ops.reply(worker, { to: 'main', text: 'for p3' })).to, 'wA:p3')
@@ -546,9 +641,8 @@ test('reopening a job a codex worker completed keeps its result: renamed and in 
 test('a job is finished once even if two callers finish it', async () => {
   claudeWorker()
   const { job } = await ops.message(me, { to: 'wA:p2', text: 'x' })
-  await ops.reply(worker, { to: 'main', text: 'answer' })
   const stale = new Store('wA').getJob(job.job_id)
-  await ops.turnEnd(worker, {})
+  await ops.turnEnd(worker, answered('answer'))
   writeFileSync(logPath, '')
   writeFileSync(stale.result_path, `job_id: ${job.job_id}\n\nanswer\n`)
   const out = await ops.jobGet(me, { job_id: job.job_id })
@@ -564,9 +658,8 @@ test('a claude worker the bridge started gets the task and later messages as the
   assert.equal(prompts('wA:p2')[0][3], task)
   await ops.message(me, { to: 'wA:p2', text: 'Also update the README.' })
   assert.equal(prompts('wA:p2')[1][3], 'Also update the README.')
-  // Completion still comes from the records: a message to main, then the end of the turn.
-  await ops.reply(worker, { to: 'main', text: 'done' })
-  assert.equal((await ops.turnEnd(worker, {})).job.status, 'completed')
+  // Completion still comes from the records: the turn's own end, with its answer.
+  assert.equal((await ops.turnEnd(worker, answered('done'))).job.status, 'completed')
 })
 
 test('a message too long or unsafe to type goes by a file and a one-line note', async () => {
