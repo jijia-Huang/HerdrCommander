@@ -29,15 +29,29 @@ export type AgentRow = {
   focused: boolean
 }
 
+/** What the sender of a job is told about, once each (keyed job id + seq). */
+export type JobEvent = {
+  seq: number
+  type: string
+  at: string
+  message_seq?: number
+  note?: string
+  by?: string
+}
+
 export type JobRow = {
   jobId: string
   from: string
   to: string
+  /** The herdr id of the worker, for a job of a herdr worker. */
+  worker: string | null
   kind: string
   status: string
   summary: string
   body: string
   resultPath: string
+  messages: Array<{ seq: number; from: string; text: string }>
+  events: JobEvent[]
 }
 
 export type BgRow = {
@@ -46,6 +60,26 @@ export type BgRow = {
   command: string
   status: string
   exitCode: number | null
+  outputFile: string
+  monitor: boolean
+  description: string
+  /** A monitor's output lines new since the last poll. */
+  newLines: string[]
+}
+
+/** A herdr worker this pane started (Agent takeover or herdr_worker_spawn). */
+export type WorkerRow = {
+  herdrId: string
+  kind: string
+  name: string | null
+  agentName: string | null
+  paneId: string | null
+  status: string
+  cwd: string
+  outputFile: string
+  note: string
+  jobId: string | null
+  queued: number
 }
 
 export type Preview = { paneId: string; text: string; at: number }
@@ -57,6 +91,9 @@ declare module 'claude-code' {
       agents: AgentRow[]
       jobs: JobRow[]
       bg: BgRow[]
+      workers: WorkerRow[]
+      /** The bridge's folder of pane screen files (from the last poll). */
+      panesDir: string | null
       lease: string | null
       selected: string | null
       preview: Preview | null
@@ -65,7 +102,7 @@ declare module 'claude-code' {
       pendingInterrupt: string | null
       paneOpen: boolean
       notice: string | null
-      /** Job ids and background ids whose completion already woke the session. */
+      /** Job event keys and background ids that already woke the session. */
       announced: string[]
     }
   }

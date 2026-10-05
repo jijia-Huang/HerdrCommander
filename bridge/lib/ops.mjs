@@ -2,7 +2,8 @@
 //   { from: caller pane id, workspace: caller workspace id, role, byUser }
 // `byUser` is set only by the Claude mod's panel buttons (a person pressed
 // them); model-driven calls (MCP, the mod's tools) never set it.
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { runJson, runText } from './herdr.mjs'
@@ -12,7 +13,11 @@ import { Store, newId } from './store.mjs'
 export const SOURCE = 'herdr-commander'
 const PANE_ID = /^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/
 const NAME = /^[a-z][a-z0-9_-]{0,31}$/
+/** queued: waiting for its worker; sent / delivery_unknown: the worker's one open job. */
 const ACTIVE_JOB = new Set(['queued', 'sent', 'delivery_unknown'])
+const OPEN_JOB = new Set(['sent', 'delivery_unknown'])
+/** With a BOM: Windows PowerShell 5.1's Get-Content reads BOM-less files in the ANSI code page. */
+const BOM = '﻿'
 
 // Agents -------------------------------------------------------------------
 
@@ -80,7 +85,7 @@ export async function listAgents(ctx = {}) {
   const active = runtimeWorkspaces().flatMap(ws => storeFor(ws).listJobs()).filter(one => ACTIVE_JOB.has(one.status))
   return agents.map(agent => {
     const { lease, owned } = info.get(agent.workspace_id) ?? { lease: null, owned: [] }
-    const job = active.find(one => one.to === agent.pane_id) ?? null
+    const job = active.find(one => one.to === agent.pane_id && OPEN_JOB.has(one.status)) ?? active.find(one => one.to === agent.pane_id) ?? null
     const own = owned.find(one => one.pane_id === agent.pane_id) ?? null
     return {
       ...agent,
@@ -197,9 +202,65 @@ function requireFrom(ctx) {
 }
 
 // Jobs -------------------------------------------------------------------------
+//
+// A job is one piece of work between a sender (`from`) and a worker (`to`, a
+// pane; while a herdr worker is still starting only its herdr id, `worker`).
+// A worker has at most one open job (sent / delivery_unknown) at a time; the
+// rest wait as `queued` and go out in order. Every decision here reads the
+// bridge's records and herdr's pane state, never text a model wrote.
+//
+// Messages: `messages` holds what went either way after the task itself
+// ({ seq, from: 'sender' | 'worker', text, at, delivered }); `events` is what
+// the sender is told about ({ seq, type, at }): a worker message, completed,
+// stopped without a message, stopped, cancelled, start failed or blocked.
+
+function now() {
+  return new Date().toISOString()
+}
+
+function nextSeq(job) {
+  return (job.seq ?? 0) + 1
+}
+
+function withMessage(job, from, text) {
+  const seq = nextSeq(job)
+  return { ...job, seq, messages: [...(job.messages ?? []), { seq, from, text, at: now(), delivered: false }] }
+}
+
+function withEvent(job, type, extra = {}) {
+  const seq = nextSeq(job)
+  return { ...job, seq, events: [...(job.events ?? []), { seq, type, at: now(), ...extra }].slice(-60) }
+}
+
+/** Every job of every workspace with the store that holds it. */
+function allJobs() {
+  return runtimeWorkspaces().flatMap(ws => {
+    const store = storeFor(ws)
+    return store.listJobs().map(job => ({ store, job }))
+  })
+}
+
+function isClaude(kind) {
+  return kind === 'claude'
+}
 
 /** The full task, with how to hand the result back, as the worker reads it from a file. */
-export function jobTaskFile(job) {
+export function jobTaskFile(job, followUps = []) {
+  const extra = followUps.length === 0 ? [] : ['', '## More from the sender', '', ...followUps.map(one => one.text)]
+  const finish = isClaude(job.to_kind)
+    ? [
+        `When you have the result, or need a decision, send it with the SendMessage tool to "main": it reaches ${job.from}, who gave you this job.`,
+        'Put everything they need in that message: what you changed, the commands you ran with their output, anything unresolved.',
+        'Then end your turn. A message sent and then stopping completes the job; a reply from them continues this same job.',
+      ]
+    : [
+        `Call the herdr_job_complete tool with job_id="${job.job_id}", a one-line \`summary\` and the full result as \`result\``,
+        '(what you changed, the commands you ran with their output, anything unresolved); the bridge writes the result file.',
+        '',
+        `Only if you do not have that tool: write the result to \`${job.result_path}\`, first line exactly \`job_id: ${job.job_id}\`.`,
+        '',
+        'Do not answer only in the terminal; the commander reads the result file.',
+      ]
   return [
     `# herdr job ${job.job_id}`,
     '',
@@ -208,16 +269,17 @@ export function jobTaskFile(job) {
     '## Task',
     '',
     job.body,
+    ...extra,
     '',
     '## When you finish',
     '',
-    `Call the herdr_job_complete tool with job_id="${job.job_id}", a one-line \`summary\` and the full result as \`result\``,
-    '(what you changed, the commands you ran with their output, anything unresolved); the bridge writes the result file.',
-    '',
-    `Only if you do not have that tool: write the result to \`${job.result_path}\`, first line exactly \`job_id: ${job.job_id}\`.`,
-    '',
-    'Do not answer only in the terminal; the commander reads the result file.',
+    ...finish,
   ].join('\n')
+}
+
+function preview(text, size = 160) {
+  const flat = String(text).replace(/\s+/g, ' ').trim()
+  return flat.length > size ? `${flat.slice(0, size)}…` : flat
 }
 
 /**
@@ -225,8 +287,23 @@ export function jobTaskFile(job) {
  * multi-line paste loses its newlines (and sometimes its Enter) in some TUIs.
  */
 export function jobPrompt(job) {
-  const preview = job.body.replace(/\s+/g, ' ').trim().slice(0, 160)
-  return `[herdr-job ${job.job_id}] from ${job.from} (${job.kind}): ${preview}${job.body.length > 160 ? '…' : ''} -- Full task: ${job.task_path} . When done, call herdr_job_complete with job_id="${job.job_id}", a one-line summary and the full result text as "result". Without that tool, write the result to ${job.result_path} (first line "job_id: ${job.job_id}").`
+  const head = `[herdr-job ${job.job_id}] from ${job.from} (${job.kind}): ${preview(job.body)} -- Full task: ${job.task_path} .`
+  if (isClaude(job.to_kind)) {
+    return `${head} When done, send the result with SendMessage to "main" and end your turn.`
+  }
+  return `${head} When done, call herdr_job_complete with job_id="${job.job_id}", a one-line summary and the full result text as "result". Without that tool, write the result to ${job.result_path} (first line "job_id: ${job.job_id}").`
+}
+
+function messageFile(job, pending) {
+  return [`# herdr job ${job.job_id}: more from ${job.from}`, '', ...pending.map(one => one.text), ''].join('\n')
+}
+
+function messagePrompt(job, path, pending) {
+  const head = `[herdr-job ${job.job_id}] more from ${job.from} on this same job: ${preview(pending.map(one => one.text).join(' '))} -- Full text: ${path} .`
+  if (isClaude(job.to_kind)) {
+    return `${head} Answer with SendMessage to "main" and end your turn.`
+  }
+  return `${head} When done, call herdr_job_complete with job_id="${job.job_id}" again (a summary and the full result as "result").`
 }
 
 /**
@@ -250,52 +327,317 @@ async function deliver(paneId, kind, text) {
   return { nudged: true }
 }
 
-export async function send(ctx, { target, kind = 'task', body }) {
+/** Hands a job's task (first time) or its undelivered sender messages to the worker pane. */
+async function deliverJob(store, job, paneId, kind) {
+  const pending = (job.messages ?? []).filter(one => one.from === 'sender' && !one.delivered)
+  const first = !job.delivered_at
+  let text
+  let next = { ...job, to: paneId, to_kind: kind }
+  if (first) {
+    writeFileSync(next.task_path, `${BOM}${jobTaskFile(next, pending)}`, 'utf8')
+    text = jobPrompt(next)
+  } else {
+    if (pending.length === 0) {
+      return job
+    }
+    const path = join(store.tasksDir, `${job.job_id}-m${pending[pending.length - 1].seq}.md`)
+    writeFileSync(path, `${BOM}${messageFile(next, pending)}`, 'utf8')
+    text = messagePrompt(next, path, pending)
+  }
+  next = {
+    ...next,
+    delivered_at: now(),
+    messages: (next.messages ?? []).map(one => (one.from === 'sender' ? { ...one, delivered: true } : one)),
+  }
+  try {
+    const { nudged } = await deliver(paneId, kind, text)
+    next.status = 'sent'
+    next.nudged = nudged
+    delete next.error
+  } catch (error) {
+    // The text may have reached the pane; never resend automatically.
+    next.status = 'delivery_unknown'
+    next.error = String(error.message ?? error)
+  }
+  store.putJob(next)
+  writeWorkerOutput(next.worker)
+  return next
+}
+
+// Recipients ------------------------------------------------------------------
+
+function liveWorker(worker) {
+  return !['stopped', 'failed'].includes(worker.status)
+}
+
+/** A herdr worker record anywhere, newest first. */
+function findWorker(predicate) {
+  for (const ws of runtimeWorkspaces()) {
+    const store = storeFor(ws)
+    const worker = store.listWorkers().find(predicate)
+    if (worker) {
+      return { store, worker }
+    }
+  }
+  return null
+}
+
+function findWorkerById(id) {
+  return findWorker(one => one.herdr_id === id)
+}
+
+/** Who a job goes to: its herdr worker (when it has one) and its pane. */
+function targetOfJob(job) {
+  const hit = job.worker ? findWorkerById(job.worker) : findWorker(one => one.pane_id === job.to && liveWorker(one))
+  return { worker: hit?.worker ?? null, paneId: hit?.worker.pane_id || job.to || '', kind: hit?.worker.worker_kind ?? job.to_kind ?? 'unknown' }
+}
+
+/**
+ * Resolves a SendMessage / TaskStop recipient: a herdr id, the name it was
+ * started with, its herdr agent name or pane id; then any herdr agent by pane
+ * id or name. Null when nothing matches (the caller hands it to Claude).
+ */
+async function resolveRecipient(ctx, to) {
+  const name = String(to ?? '')
+  if (name === '') {
+    return null
+  }
+  let hit = name.startsWith('herdr-') ? findWorkerById(name) : null
+  if (!hit && ctx.workspace) {
+    const store = storeFor(ctx.workspace)
+    const worker = store.listWorkers().find(one => one.owner === ctx.from && liveWorker(one) && (one.name === name || one.agent_name === name || one.pane_id === name))
+    hit = worker ? { store, worker } : null
+  }
+  if (hit) {
+    return { worker: hit.worker, store: hit.store, paneId: hit.worker.pane_id ?? '', kind: hit.worker.worker_kind, agent: null }
+  }
+  if (name.startsWith('herdr-')) {
+    return null
+  }
+  const agents = await rawAgents()
+  const agent = agents.find(one => one.pane_id === name || one.name === name) ?? null
+  if (!agent && !PANE_ID.test(name)) {
+    return null
+  }
+  const paneId = agent?.pane_id ?? name
+  const rec = findWorker(one => one.pane_id === paneId && liveWorker(one))
+  return { worker: rec?.worker ?? null, store: rec?.store ?? null, paneId, kind: agent?.kind ?? rec?.worker.worker_kind ?? 'unknown', agent }
+}
+
+function jobsFor(target) {
+  return allJobs().filter(({ job }) => (target.worker && job.worker === target.worker.herdr_id) || (target.paneId !== '' && job.to === target.paneId))
+}
+
+function queuedAt(job) {
+  return String(job.queued_at ?? job.created_at)
+}
+
+/** Delivers the oldest queued job of a worker that has no open job and is up. */
+async function pump(target) {
+  if (!target.paneId || (target.worker && target.worker.status !== 'running')) {
+    return null
+  }
+  const list = jobsFor(target)
+  if (list.some(({ job }) => OPEN_JOB.has(job.status))) {
+    return null
+  }
+  const next = list.filter(({ job }) => job.status === 'queued').sort((a, b) => queuedAt(a.job).localeCompare(queuedAt(b.job)))[0]
+  if (!next) {
+    return null
+  }
+  return deliverJob(next.store, next.job, target.paneId, target.kind)
+}
+
+// Sending: sender → worker ------------------------------------------------------
+
+/**
+ * A message from a sender to a worker. A job this sender has open (or queued)
+ * with the worker takes it in and gets it now; else the sender's latest
+ * completed job with the worker reopens; else a new job. A worker busy with
+ * another sender's job gets it after that job (queued).
+ */
+export async function message(ctx, { to, text, kind = 'task' }) {
   requireFrom(ctx)
   const ws = requireWorkspace(ctx)
-  if (typeof body !== 'string' || body.trim() === '') {
+  if (typeof text !== 'string' || text.trim() === '') {
     throw new BridgeError('bad_body', 'body is required')
   }
   if (!['task', 'question'].includes(kind)) {
     throw new BridgeError('bad_kind', 'kind must be task or question')
   }
-  const { paneId, agent } = await resolveTarget(target)
-  notSelf(ctx, paneId)
-  const targetLease = agent ? storeFor(agent.workspace_id).getLease() : null
-  if (targetLease && targetLease.pane_id === paneId) {
-    throw new BridgeError('target_is_commander', `${paneId} is a commander; commanders do not take jobs`)
+  const target = await resolveRecipient(ctx, to)
+  if (!target) {
+    throw new BridgeError('no_target', `no herdr worker, agent or pane named ${to}`)
   }
-  const store = storeFor(ws)
-  const jobId = newId('job')
-  const job = {
-    job_id: jobId,
-    workspace_id: ws,
-    from: ctx.from,
-    to: paneId,
-    to_kind: agent?.kind ?? 'unknown',
-    kind,
-    body,
-    result_path: store.resultPath(jobId),
-    task_path: store.taskPath(jobId),
-    status: 'queued',
-    review: 'pending',
-    created_at: new Date().toISOString(),
+  if (target.paneId) {
+    notSelf(ctx, target.paneId)
   }
-  // With a BOM: Windows PowerShell 5.1's Get-Content reads BOM-less files in
-  // the ANSI code page, which garbles a non-ASCII task for a Codex worker.
-  writeFileSync(job.task_path, `﻿${jobTaskFile(job)}`, 'utf8')
-  store.putJob(job)
-  try {
-    const { nudged } = await deliver(paneId, job.to_kind, jobPrompt(job))
-    job.status = 'sent'
-    job.nudged = nudged
-  } catch (error) {
-    // The text may have reached the pane; never resend automatically.
-    job.status = 'delivery_unknown'
-    job.error = String(error.message ?? error)
+  if (!target.worker && target.agent) {
+    const targetLease = storeFor(target.agent.workspace_id).getLease()
+    if (targetLease && targetLease.pane_id === target.paneId) {
+      throw new BridgeError('target_is_commander', `${target.paneId} is a commander; commanders do not take jobs`)
+    }
   }
-  store.putJob(job)
+  if (target.worker && !liveWorker(target.worker)) {
+    throw new BridgeError('worker_gone', `${target.worker.herdr_id} is ${target.worker.status}`)
+  }
+  const list = jobsFor(target)
+  const mine = list.filter(({ job }) => job.from === ctx.from)
+  const active = mine.find(({ job }) => ACTIVE_JOB.has(job.status))
+  if (active) {
+    let job = withMessage(active.job, 'sender', text)
+    active.store.putJob(job)
+    if (OPEN_JOB.has(job.status)) {
+      job = await deliverJob(active.store, job, target.paneId, target.kind)
+    }
+    writeWorkerOutput(job.worker)
+    return { job, action: 'appended', ahead: 0 }
+  }
+  const last = mine.filter(({ job }) => job.status === 'completed').sort((a, b) => String(b.job.completed_at).localeCompare(String(a.job.completed_at)))[0]
+  let held
+  let action
+  if (last) {
+    const own = last.store.resultPath(last.job.job_id)
+    if (last.job.result_path === own) {
+      rmSync(own, { force: true })
+    }
+    held = {
+      store: last.store,
+      job: withMessage({ ...last.job, status: 'queued', queued_at: now(), result_path: own, replied_at: null, reminded_at: null, woken: null, reopened: (last.job.reopened ?? 0) + 1 }, 'sender', text),
+    }
+    action = 'reopened'
+  } else {
+    const store = storeFor(ws)
+    const jobId = newId('job')
+    held = {
+      store,
+      job: {
+        job_id: jobId,
+        workspace_id: ws,
+        from: ctx.from,
+        to: target.paneId,
+        worker: target.worker?.herdr_id ?? null,
+        to_kind: target.kind,
+        kind,
+        body: text,
+        result_path: store.resultPath(jobId),
+        task_path: store.taskPath(jobId),
+        status: 'queued',
+        review: 'pending',
+        messages: [],
+        events: [],
+        seq: 0,
+        created_at: now(),
+        queued_at: now(),
+      },
+    }
+    action = 'new'
+  }
+  held.store.putJob(held.job)
+  const ahead = list.filter(({ job }) => job.job_id !== held.job.job_id && ACTIVE_JOB.has(job.status)).length
+  const delivered = await pump(target)
+  const job = delivered?.job_id === held.job.job_id ? delivered : held.store.getJob(held.job.job_id)
+  writeWorkerOutput(job.worker)
+  return { job, action, ahead: job.status === 'queued' ? ahead : 0 }
+}
+
+/** The Codex MCP tool and older callers: a task or question as a tracked job. */
+export async function send(ctx, { target, kind = 'task', body }) {
+  if (typeof target !== 'string' || target === '') {
+    throw new BridgeError('bad_target', 'target is required (pane id or agent name)')
+  }
+  return message(ctx, { to: target, text: body, kind })
+}
+
+// Replying: worker → sender ------------------------------------------------------
+
+/**
+ * A SendMessage from a pane that has jobs: to "main" goes to the sender of its
+ * open job (else of its latest job); to a sender's pane id or name goes to
+ * that sender. Passed on whole, whatever it says, and recorded as "the worker
+ * sent a message". `routed: false` when this pane has no such job.
+ */
+export async function reply(ctx, { to, text }) {
+  requireFrom(ctx)
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new BridgeError('bad_body', 'message is required')
+  }
+  const mine = allJobs().filter(({ job }) => job.to === ctx.from && job.status !== 'queued')
+  if (mine.length === 0) {
+    return { routed: false }
+  }
+  let candidates = mine
+  if (to !== 'main') {
+    let senderPane = String(to)
+    if (!PANE_ID.test(senderPane)) {
+      const agents = await rawAgents().catch(() => [])
+      senderPane = agents.find(one => one.name === senderPane)?.pane_id ?? senderPane
+    }
+    candidates = mine.filter(({ job }) => job.from === senderPane)
+  }
+  if (candidates.length === 0) {
+    return { routed: false }
+  }
+  const latest = (list, key) => list.slice().sort((a, b) => String(b.job[key] ?? '').localeCompare(String(a.job[key] ?? '')))[0]
+  const open = candidates.filter(({ job }) => OPEN_JOB.has(job.status))
+  const hit = open.length > 0 ? latest(open, 'delivered_at') : latest(candidates, 'updated_at')
+  const isOpen = OPEN_JOB.has(hit.job.status)
+  let job = withMessage(hit.job, 'worker', text)
+  job = { ...job, messages: job.messages.map(one => (one.seq === job.seq ? { ...one, delivered: true } : one)) }
+  if (isOpen) {
+    job.replied_at = now()
+  }
+  job = withEvent(job, 'message', { message_seq: job.seq })
+  hit.store.putJob(job)
+  writeWorkerOutput(job.worker)
+  return { routed: true, job_id: job.job_id, to: job.from, open: isOpen }
+}
+
+/**
+ * The worker pane's turn ended (its own mod says so). With a message sent
+ * since the last delivery, its open job completes; without one, the sender
+ * is told once that it stopped without a message. Then the next queued job.
+ */
+export async function turnEnd(ctx, { started_at: startedAt } = {}) {
+  requireFrom(ctx)
+  const open = allJobs()
+    .filter(({ job }) => job.to === ctx.from && OPEN_JOB.has(job.status))
+    .sort((a, b) => String(b.job.delivered_at).localeCompare(String(a.job.delivered_at)))[0]
+  if (!open) {
+    return { job: null }
+  }
+  const { store } = open
+  let job = open.job
+  if (job.replied_at && job.replied_at >= job.delivered_at) {
+    job = await finishJob(store, { ...job, completed_via: 'message' })
+    return { job, completed: true }
+  }
+  // A turn that began before the job arrived says nothing about the job.
+  const began = typeof startedAt === 'number' ? new Date(startedAt).toISOString() : null
+  const coversJob = began === null || began >= job.delivered_at
+  if (coversJob && !(job.reminded_at && job.reminded_at >= job.delivered_at)) {
+    job = withEvent({ ...job, reminded_at: now() }, 'stopped_without_message')
+    store.putJob(job)
+    return { job, reminded: true }
+  }
   return { job }
+}
+
+/** Marks a job completed (any route) and runs what follows once. */
+async function finishJob(store, job) {
+  const done = { ...job, status: 'completed', completed_at: now() }
+  if (job.completed_via === 'message') {
+    const sent = (job.messages ?? []).filter(one => one.from === 'worker')
+    const last = sent[sent.length - 1]
+    done.summary = String(last?.text ?? '').split(/\r?\n/).find(line => line.trim() !== '')?.trim().slice(0, 200) ?? ''
+    writeFileSync(job.result_path, `job_id: ${job.job_id}\n\n${sent.map(one => one.text).join('\n\n---\n\n')}\n`, 'utf8')
+  }
+  const marked = withEvent(done, 'completed')
+  store.putJob(marked)
+  const out = await onCompleted(store, marked)
+  writeWorkerOutput(out.worker)
+  await pump(targetOfJob(out)).catch(() => null)
+  return out
 }
 
 /** A plain prompt typed by the person from the Commander panel (no job). */
@@ -322,14 +664,12 @@ function readResultHeader(path) {
 
 /** Marks a job whose result file has appeared (with the right header) completed. */
 async function reconcile(store, job) {
-  if (!ACTIVE_JOB.has(job.status)) {
+  if (!OPEN_JOB.has(job.status)) {
     return job
   }
   const header = readResultHeader(job.result_path)
   if (header && header.jobId === job.job_id) {
-    const done = { ...job, status: 'completed', summary: job.summary ?? header.summary, completed_at: new Date().toISOString(), completed_via: 'result_file' }
-    store.putJob(done)
-    return onCompleted(store, done)
+    return finishJob(store, { ...job, summary: job.summary ?? header.summary, completed_via: 'result_file' })
   }
   return job
 }
@@ -369,19 +709,11 @@ export async function jobComplete(ctx, { job_id: jobId, summary = '', result, re
   if (!existsSync(path)) {
     throw new BridgeError('no_result', `pass the full result as "result", or write it to ${job.result_path} first`)
   }
-  const done = {
-    ...job,
-    status: 'completed',
-    summary: String(summary).slice(0, 500),
-    result_path: path,
-    completed_at: new Date().toISOString(),
-    completed_via: 'tool',
-  }
-  store.putJob(done)
-  return { job: await onCompleted(store, done), accepted: true }
+  const done = await finishJob(store, { ...job, summary: String(summary).slice(0, 500), result_path: path, completed_via: 'tool' })
+  return { job: done, accepted: true }
 }
 
-/** Runs once, at the moment a job becomes completed (by tool or by result file). */
+/** Runs once, at the moment a job becomes completed (by tool, result file or message). */
 async function onCompleted(store, job) {
   await notify({}, { title: `job done: ${job.to}`, body: job.summary || job.job_id, sound: 'done' }).catch(() => {})
   return tryWake(store, job)
@@ -398,7 +730,7 @@ export async function tryWake(store, job) {
     return job
   }
   const settle = woken => {
-    const next = { ...job, woken }
+    const next = { ...store.getJob(job.job_id), woken }
     store.putJob(next)
     return next
   }
@@ -427,6 +759,9 @@ export async function tryWake(store, job) {
 /** Retries the wake of every completed job this pane sent that has not woken it yet. */
 export async function wakePending(ctx) {
   const store = storeFor(requireWorkspace(ctx))
+  for (const job of store.listJobs().filter(one => one.from === ctx.from && OPEN_JOB.has(one.status))) {
+    await reconcile(store, job).catch(() => null)
+  }
   const pending = store.listJobs().filter(job => job.from === ctx.from && job.status === 'completed' && !job.woken)
   let woken = 0
   for (const job of pending) {
@@ -460,20 +795,25 @@ function workerName(name, kind) {
   return NAME.test(candidate) ? candidate : `worker-${Math.random().toString(36).slice(2, 6)}`
 }
 
+/** A herdr id: `herdr-<kind>-<workspace>-<6 hex>`; no pane, which is known only after the split. */
+export function newHerdrId(kind, workspace) {
+  return `herdr-${kind}-${workspace}-${randomBytes(3).toString('hex')}`
+}
+
 /**
  * The command that starts a Claude worker with this same plugin: the installed
  * copy loads by itself; a working copy goes by --plugin-dir, which also takes
  * precedence over an installed copy of the same name.
  */
-export function claudeLine(root = TOOL_ROOT) {
-  return isInstalledCopy(root) ? 'claude' : `claude --plugin-dir '${root}'`
+export function claudeLine(root = TOOL_ROOT, { model } = {}) {
+  const base = isInstalledCopy(root) ? 'claude' : `claude --plugin-dir '${root}'`
+  return model && /^[A-Za-z0-9._-]+$/.test(model) ? `${base} --model ${model}` : base
 }
 
-export async function spawn(ctx, { kind = 'claude', name, cwd, task, direction = 'right' }) {
-  requireFrom(ctx)
+/** Workers never start panes; a plain pane may while no other live pane holds the commander lease. */
+async function requireMayStart(ctx) {
   const ws = requireWorkspace(ctx)
-  // Workers never spawn (no recursive panes). Otherwise the commander may, and
-  // a plain session may while no other live pane holds the commander lease.
+  requireFrom(ctx)
   if (ctx.role === 'worker' || process.env.HERDR_COMMANDER_ROLE === 'worker') {
     throw new BridgeError('worker_cannot_spawn', 'workers do not spawn further workers')
   }
@@ -483,14 +823,15 @@ export async function spawn(ctx, { kind = 'claude', name, cwd, task, direction =
       throw new BridgeError('not_commander', `${holder.pane_id} is this workspace's commander; ask it to spawn workers`)
     }
   }
-  if (!['claude', 'codex'].includes(kind)) {
-    throw new BridgeError('bad_kind', 'kind must be claude or codex')
-  }
-  const dir = cwd || process.cwd()
+  return ws
+}
+
+/** Splits a pane beside the caller and starts the agent there; waits until herdr sees it settle. */
+async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, model }) {
   const split = await runJson([
     'pane', 'split', '--pane', ctx.from,
     '--direction', direction === 'down' ? 'down' : 'right',
-    '--cwd', dir,
+    '--cwd', cwd,
     '--env', 'HERDR_COMMANDER_ROLE=worker',
     '--env', `HERDR_COMMANDER_PARENT=${ctx.from}`,
     '--no-focus',
@@ -501,30 +842,216 @@ export async function spawn(ctx, { kind = 'claude', name, cwd, task, direction =
   }
   const store = storeFor(ws)
   const agentName = workerName(name, kind)
-  store.addOwned({ pane_id: paneId, owner: ctx.from, kind, name: agentName, created_at: new Date().toISOString() })
+  store.addOwned({ pane_id: paneId, owner: ctx.from, kind, name: agentName, created_at: now() })
   // The pane shell is PowerShell 5.1, which mangles embedded quotes in native
   // arguments; so the command line typed there carries no quoted payload.
   const line = kind === 'claude'
-    ? claudeLine()
+    ? claudeLine(TOOL_ROOT, { model })
     : `& '${process.execPath}' '${CLI_PATH}' codex-launch b64:${Buffer.from(JSON.stringify({ role: 'worker', pane: paneId, workspace: ws })).toString('base64')}`
   await runJson(['pane', 'run', paneId, line])
-  const detected = await waitForAgent(paneId, kind, 90000)
+  const detected = await waitForAgent(paneId, kind, Number(process.env.HERDR_BRIDGE_START_MS ?? 90000))
+  if (detected) {
+    await runJson(['agent', 'rename', paneId, agentName]).catch(() => {})
+  }
+  return { paneId, agentName, detected }
+}
+
+/** The Codex MCP tool: opens a worker pane now and sends it the first task (if any). */
+export async function spawn(ctx, { kind = 'claude', name, cwd, task, direction = 'right' }) {
+  const ws = await requireMayStart(ctx)
+  if (!['claude', 'codex'].includes(kind)) {
+    throw new BridgeError('bad_kind', 'kind must be claude or codex')
+  }
+  const { paneId, agentName, detected } = await openWorkerPane(ctx, ws, { kind, cwd: cwd || process.cwd(), direction, name })
   if (!detected) {
     return { pane_id: paneId, name: agentName, started: false, error: `no ${kind} agent detected in ${paneId} within 90s (check the pane for a trust or login prompt)` }
   }
-  await runJson(['agent', 'rename', paneId, agentName]).catch(() => {})
   const out = { pane_id: paneId, name: agentName, started: true }
   if (detected.agent_status === 'blocked') {
     // A worker that comes up blocked waits on the person (a folder trust or
     // login prompt): typing the task there would answer that prompt.
     out.blocked = true
-    out.note = `${paneId} is waiting on a prompt (folder trust, login, ...); the person must answer it in that pane. The task was not sent: send it with herdr_message_send once the worker is idle.`
+    out.note = `${paneId} is waiting on a prompt (folder trust, login, ...); the person must answer it in that pane. The task was not sent: send it with SendMessage (or herdr_message_send) once the worker is idle.`
     return out
   }
   if (task) {
     out.job = (await send(ctx, { target: paneId, kind: 'task', body: task })).job
   }
   return out
+}
+
+function samePath(a, b) {
+  const canon = path => {
+    let full = resolve(path)
+    try {
+      full = realpathSync.native(full)
+    } catch {}
+    return full.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
+  }
+  return canon(a) === canon(b)
+}
+
+/**
+ * Records a herdr worker and its first job, and returns at once: the herdr id,
+ * the output file. The pane is opened by worker-start, which the caller runs
+ * in the background (it can take up to ~90 s while the agent starts).
+ * `forbid_cwd`: refuse that folder (herdr_worker_spawn is for other folders).
+ */
+export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, subagent_type: subagentType, description, forbid_cwd: forbidCwd }) {
+  const ws = await requireMayStart(ctx)
+  if (!['claude', 'codex'].includes(kind)) {
+    throw new BridgeError('bad_kind', 'kind must be claude or codex')
+  }
+  if (typeof task !== 'string' || task.trim() === '') {
+    throw new BridgeError('bad_body', 'the first task is required')
+  }
+  const dir = cwd || process.cwd()
+  let isDir = false
+  try {
+    isDir = statSync(dir).isDirectory()
+  } catch {}
+  if (!isDir) {
+    throw new BridgeError('no_folder', `${dir} is not an existing folder`)
+  }
+  if (forbidCwd && samePath(dir, forbidCwd)) {
+    throw new BridgeError('same_folder', 'that is this session\'s own folder: use the Agent tool with subagent_type herdr-commander:claude-worker or herdr-commander:codex-worker instead')
+  }
+  const store = storeFor(ws)
+  const herdrId = newHerdrId('agent', ws)
+  const worker = {
+    herdr_id: herdrId,
+    worker_kind: kind,
+    pane_id: null,
+    owner: ctx.from,
+    workspace_id: ws,
+    name: typeof name === 'string' && name !== '' ? name : null,
+    agent_name: null,
+    subagent_type: subagentType ?? null,
+    description: description ?? null,
+    model: model ?? null,
+    cwd: dir,
+    output_file: store.outputPath(herdrId),
+    status: 'starting',
+    created_at: now(),
+  }
+  store.putWorker(worker)
+  const { job } = await message(ctx, { to: herdrId, text: task, kind: 'task' })
+  writeWorkerOutput(herdrId)
+  return { worker: store.getWorker(herdrId), job }
+}
+
+/** Opens the pane of a recorded herdr worker and delivers its queued job. */
+export async function workerStart(ctx, { herdr_id: herdrId }) {
+  const ws = requireWorkspace(ctx)
+  const store = storeFor(ws)
+  const worker = store.getWorker(String(herdrId))
+  if (!worker || worker.owner !== ctx.from) {
+    throw new BridgeError('no_worker', `no herdr worker ${herdrId} of ${ctx.from}`)
+  }
+  if (worker.status !== 'starting') {
+    return { worker }
+  }
+  const failWith = (status, type, note) => {
+    const next = { ...store.getWorker(worker.herdr_id), status, note }
+    store.putWorker(next)
+    for (const { store: jobStore, job } of jobsFor({ worker: next, paneId: '' })) {
+      if (ACTIVE_JOB.has(job.status)) {
+        const marked = withEvent(status === 'failed' ? { ...job, status: 'failed', error: note } : job, type, { note })
+        jobStore.putJob(marked)
+      }
+    }
+    writeWorkerOutput(next.herdr_id)
+    return { worker: next }
+  }
+  let opened
+  try {
+    opened = await openWorkerPane(ctx, ws, { kind: worker.worker_kind, cwd: worker.cwd, name: worker.name ?? worker.description ?? undefined, model: worker.model ?? undefined })
+  } catch (error) {
+    return failWith('failed', 'start_failed', `${error.code ?? 'error'}: ${error.message ?? error}`)
+  }
+  const { paneId, agentName, detected } = opened
+  store.putWorker({ ...store.getWorker(worker.herdr_id), pane_id: paneId, agent_name: agentName })
+  if (!detected) {
+    return failWith('failed', 'start_failed', `no ${worker.worker_kind} agent detected in ${paneId} within 90s (check the pane for a trust or login prompt)`)
+  }
+  if (detected.agent_status === 'blocked') {
+    return failWith('blocked', 'start_blocked', `${paneId} is waiting on a prompt (folder trust, login, ...); the person must answer it in that pane. The task goes out once the worker is idle.`)
+  }
+  const running = { ...store.getWorker(worker.herdr_id), status: 'running' }
+  store.putWorker(running)
+  await pump({ worker: running, paneId, kind: running.worker_kind })
+  writeWorkerOutput(running.herdr_id)
+  return { worker: store.getWorker(worker.herdr_id) }
+}
+
+/**
+ * TaskStop: ends a herdr worker (Ctrl+C, then its pane closes) or a herdr
+ * background command, without asking (as native TaskStop). Only panes this
+ * caller started; `matched: false` when the id is not herdr's at all.
+ */
+export async function stop(ctx, { target }) {
+  requireFrom(ctx)
+  const ws = requireWorkspace(ctx)
+  const name = String(target ?? '')
+  const store = storeFor(ws)
+  const bg = name.startsWith('herdr-') ? store.getBg(name) : null
+  if (bg) {
+    if (bg.owner !== ctx.from) {
+      throw new BridgeError('not_owner', `${name} was started by ${bg.owner}, not by you`)
+    }
+    return { kind: 'bg', ...(await bgStop(ctx, { id: name, close: true })) }
+  }
+  const hit = await resolveRecipient(ctx, name)
+  if (!hit) {
+    return { matched: false }
+  }
+  const owned = hit.paneId ? store.getOwned().find(one => one.pane_id === hit.paneId) : null
+  const mine = hit.worker ? hit.worker.owner === ctx.from : owned?.owner === ctx.from
+  if (!mine) {
+    throw new BridgeError('not_owned', `${hit.worker?.herdr_id ?? hit.paneId} was not started by this pane; TaskStop ends only herdr workers this pane started`)
+  }
+  if (hit.paneId) {
+    await runJson(['agent', 'send-keys', hit.paneId, 'ctrl+c']).catch(() => {})
+    if (store.isOwned(hit.paneId)) {
+      await runJson(['pane', 'close', hit.paneId]).catch(() => {})
+      store.removeOwned(hit.paneId)
+    }
+  }
+  if (hit.worker) {
+    hit.store.putWorker({ ...hit.worker, status: 'stopped', stopped_at: now() })
+  }
+  let stopped = 0
+  let cancelled = 0
+  for (const { store: jobStore, job } of jobsFor(hit)) {
+    if (OPEN_JOB.has(job.status)) {
+      jobStore.putJob(withEvent({ ...job, status: 'stopped', ended_at: now() }, 'stopped', { by: ctx.from }))
+      stopped += 1
+    } else if (job.status === 'queued') {
+      jobStore.putJob(withEvent({ ...job, status: 'cancelled', ended_at: now() }, 'cancelled', { by: ctx.from }))
+      cancelled += 1
+    }
+  }
+  if (hit.worker) {
+    writeWorkerOutput(hit.worker.herdr_id)
+  }
+  return { kind: 'agent', herdr_id: hit.worker?.herdr_id ?? null, pane_id: hit.paneId || null, closed: Boolean(hit.paneId), stopped_jobs: stopped, cancelled_jobs: cancelled }
+}
+
+/**
+ * Any SendMessage from a Claude pane in herdr: a reply when this pane works on
+ * a job of that recipient, else a message to a herdr worker, agent or pane,
+ * else `none` (the mod hands it to Claude's own SendMessage).
+ */
+export async function route(ctx, { to, text }) {
+  const replied = await reply(ctx, { to, text })
+  if (replied.routed) {
+    return { action: 'reply', ...replied }
+  }
+  if (to === 'main' || !(await resolveRecipient(ctx, to).catch(() => null))) {
+    return { action: 'none' }
+  }
+  const sent = await message(ctx, { to, text, kind: 'task' })
+  return { ...sent, action: 'message', how: sent.action }
 }
 
 /** Polls herdr until it recognizes an agent of `kind` in the pane and it settles. */
@@ -556,6 +1083,97 @@ export async function closePane(ctx, { pane }) {
   await runJson(['pane', 'close', pane])
   store.removeOwned(pane)
   return { closed: pane }
+}
+
+// Output files: what the model Reads ---------------------------------------------
+
+function stamp(iso) {
+  return String(iso ?? '').replace('T', ' ').slice(0, 19)
+}
+
+/** Rewrites a herdr worker's output file from the records (and a screen, when given). */
+function writeWorkerOutput(herdrId, screen = null) {
+  if (!herdrId) {
+    return
+  }
+  const hit = findWorkerById(herdrId)
+  if (!hit) {
+    return
+  }
+  const { worker } = hit
+  const jobs = jobsFor({ worker, paneId: worker.pane_id ?? '' }).map(({ job }) => job).sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+  const lines = [
+    `# herdr worker ${worker.herdr_id}`,
+    '',
+    `${worker.worker_kind} worker${worker.name ? ` "${worker.name}"` : ''} · status ${worker.status} · pane ${worker.pane_id ?? '(starting)'} · folder ${worker.cwd} · started by ${worker.owner}`,
+    worker.note ? `Note: ${worker.note}` : '',
+    'Read this file again for the latest; it is rewritten on every message and on every Read.',
+  ]
+  for (const job of jobs) {
+    lines.push('', `## Job ${job.job_id} (${job.status}) from ${job.from}`, '', '### Task', '', job.body)
+    for (const one of job.messages ?? []) {
+      lines.push('', `### ${stamp(one.at)} ${one.from === 'worker' ? 'worker → sender' : 'sender → worker'}`, '', one.text)
+    }
+  }
+  if (screen !== null) {
+    lines.push('', `## Screen of ${worker.pane_id} (${stamp(now())})`, '', '```', screen, '```')
+  }
+  writeFileSync(worker.output_file, `${lines.filter(line => line !== null).join('\n')}\n`, 'utf8')
+}
+
+function under(path, dir) {
+  const norm = value => resolve(value).replace(/[\\/]+/g, '/').toLowerCase()
+  const full = norm(path)
+  const base = `${norm(dir)}/`
+  return full.startsWith(base) ? full.slice(base.length) : null
+}
+
+/**
+ * Called by the mod before a Read of a runtime file: a herdr worker's output
+ * file gets its pane's current screen; a pane screen file (panes/<pane>.txt)
+ * is (re)written from herdr. Anything else is left alone.
+ */
+export async function refresh(ctx, { path }) {
+  const rest = under(String(path ?? ''), runtimeRoot())
+  if (rest === null) {
+    return { refreshed: false }
+  }
+  const [ws, folder, file] = rest.split('/')
+  if (!ws || !/^[a-z0-9_-]+$/.test(ws) || !file) {
+    return { refreshed: false }
+  }
+  const known = runtimeWorkspaces().find(one => one.toLowerCase() === ws)
+  if (!known) {
+    return { refreshed: false }
+  }
+  const store = storeFor(known)
+  if (folder === 'out' && file.endsWith('.md')) {
+    const worker = store.listWorkers().find(one => `${one.herdr_id.toLowerCase()}.md` === file)
+    if (!worker) {
+      return { refreshed: false }
+    }
+    let screen = null
+    if (worker.pane_id && worker.status !== 'stopped') {
+      screen = await runText(['pane', 'read', worker.pane_id, '--source', 'recent-unwrapped', '--lines', '120']).then(text => text.replace(/\s+$/, '')).catch(error => `(cannot read the pane: ${error.message ?? error})`)
+    }
+    writeWorkerOutput(worker.herdr_id, screen)
+    return { refreshed: true, path: worker.output_file }
+  }
+  if (folder === 'panes' && file.endsWith('.txt')) {
+    const paneId = file.slice(0, -4).replace(/^(w[a-z0-9]+)-(p[a-z0-9]+)$/i, '$1:$2')
+    const agents = await rawAgents().catch(() => [])
+    const real = agents.find(one => one.pane_id.toLowerCase() === paneId.toLowerCase())?.pane_id ?? paneId
+    let text
+    try {
+      text = (await read(ctx, { target: real, lines: 200 })).text
+    } catch (error) {
+      text = `(cannot read ${real}: ${error.message ?? error})`
+    }
+    const target = store.panePath(real)
+    writeFileSync(target, `# Screen of herdr pane ${real} (${stamp(now())}); Read this file again for the latest\n\n${text}\n`, 'utf8')
+    return { refreshed: true, path: target }
+  }
+  return { refreshed: false }
 }
 
 // Lifecycle, metadata, notifications ---------------------------------------------
@@ -617,27 +1235,80 @@ export async function notify(ctx, { title, body, sound = 'none' }) {
   return { shown: true }
 }
 
-// Background commands (B path: separate tools, native Bash untouched) ----------
+// Background commands and monitors (Bash / PowerShell run_in_background, Monitor) --
+//
+// Each runs in its own pane below the caller. The command goes into a script
+// file, never onto the pane's command line (PowerShell 5.1 mangles quotes);
+// a runner script tees its output into a UTF-8 log (the outputFile the model
+// Reads) and writes the exit code into a file of its own, which is how the
+// bridge learns the command ended: no screen parsing.
 
-/**
- * The line typed into the pane's PowerShell. The command runs in a child
- * powershell.exe given as -EncodedCommand (UTF-16LE base64): no quoting
- * survives PowerShell 5.1 intact, and an `exit` in the command would close
- * the pane's own shell. -NoProfile: the child inherits the pane shell's
- * environment (an activated conda env included) without the slow profile. The marker prints the child's exit code afterwards;
- * ${LASTEXITCODE} is braced since "$LASTEXITCODE:" parses as a drive variable.
- */
-export function wrapCommand(id, command) {
-  const encoded = Buffer.from(command, 'utf16le').toString('base64')
-  return `powershell.exe -NoLogo -NoProfile -EncodedCommand ${encoded}; Write-Host "[herdr-bg-exit:${id}:` + '${LASTEXITCODE}:$?]"'
+/** Git Bash, for Bash-tool commands: HERDR_BRIDGE_BASH or CLAUDE_CODE_GIT_BASH_PATH, else the usual install. */
+export function bashPath() {
+  const candidates = [process.env.HERDR_BRIDGE_BASH, process.env.CLAUDE_CODE_GIT_BASH_PATH, 'C:\\Program Files\\Git\\bin\\bash.exe'].filter(Boolean)
+  return candidates.find(path => existsSync(path)) ?? 'bash'
 }
 
-export async function bgRun(ctx, { command, cwd, name }) {
-  requireFrom(ctx)
-  const ws = requireWorkspace(ctx)
+function posix(path) {
+  return String(path).replace(/\\/g, '/')
+}
+
+function bashQuote(text) {
+  return `'${String(text).replace(/'/g, `'\\''`)}'`
+}
+
+function psQuote(text) {
+  return `'${String(text).replace(/'/g, "''")}'`
+}
+
+/** Writes the command and its runner; returns the line typed into the pane's PowerShell. */
+export function bgScripts(store, id, shell, command) {
+  const log = store.bgFile(id, '.log')
+  const exit = store.bgFile(id, '.exit')
+  writeFileSync(log, '', 'utf8')
+  rmSync(exit, { force: true })
+  if (shell === 'bash') {
+    const cmd = store.bgFile(id, '.cmd.sh')
+    const runner = store.bgFile(id, '.run.sh')
+    writeFileSync(cmd, `${command}\n`, 'utf8')
+    // `exit` in the command ends only the subshell; PIPESTATUS keeps its code past tee.
+    writeFileSync(runner, [
+      `( source ${bashQuote(posix(cmd))} ) 2>&1 | tee -a ${bashQuote(posix(log))}`,
+      `echo "\${PIPESTATUS[0]}" > ${bashQuote(posix(exit))}`,
+      '',
+    ].join('\n'), 'utf8')
+    return `& ${psQuote(bashPath())} ${psQuote(runner)}`
+  }
+  const cmd = store.bgFile(id, '.cmd.ps1')
+  writeFileSync(cmd, `${BOM}${command}\n`, 'utf8')
+  // The command runs in a child powershell.exe given as -EncodedCommand, so an
+  // `exit` in it ends the child (its exit code) and never the pane's shell.
+  const runner = [
+    '$enc = New-Object System.Text.UTF8Encoding($false)',
+    `$cmd = [IO.File]::ReadAllText(${psQuote(cmd)})`,
+    '$b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))',
+    `& powershell.exe -NoLogo -NoProfile -EncodedCommand $b64 2>&1 | ForEach-Object { $s = "$_"; Write-Host $s; [IO.File]::AppendAllText(${psQuote(log)}, $s + [Environment]::NewLine, $enc) }`,
+    `[IO.File]::WriteAllText(${psQuote(exit)}, [string]$LASTEXITCODE, $enc)`,
+  ].join('\n')
+  return `powershell.exe -NoLogo -NoProfile -EncodedCommand ${Buffer.from(runner, 'utf16le').toString('base64')}`
+}
+
+/**
+ * Runs a command in a new pane below the caller under a herdr id
+ * (`herdr-bg-…`, or `herdr-mon-…` for a Monitor, whose each output line is an
+ * event and which is stopped at its deadline). Same start rules as workers.
+ */
+export async function bgRun(ctx, { command, cwd, name, shell = 'powershell', monitor = false, timeout_ms: timeoutMs, description }) {
+  const ws = await requireMayStart(ctx)
   if (typeof command !== 'string' || command.trim() === '') {
     throw new BridgeError('bad_command', 'command is required')
   }
+  if (!['bash', 'powershell'].includes(shell)) {
+    throw new BridgeError('bad_shell', 'shell must be bash or powershell')
+  }
+  const store = storeFor(ws)
+  const id = newHerdrId(monitor ? 'mon' : 'bg', ws)
+  const line = bgScripts(store, id, shell, command)
   const split = await runJson([
     'pane', 'split', '--pane', ctx.from, '--direction', 'down',
     '--cwd', cwd || process.cwd(),
@@ -648,18 +1319,40 @@ export async function bgRun(ctx, { command, cwd, name }) {
   if (!paneId) {
     throw new BridgeError('split_failed', 'herdr did not return the new pane id')
   }
-  const store = storeFor(ws)
-  const id = newId('bg')
-  store.addOwned({ pane_id: paneId, owner: ctx.from, kind: 'shell', name: name || id, created_at: new Date().toISOString() })
-  const bg = { id, pane_id: paneId, owner: ctx.from, command, name: name || null, status: 'running', started_at: new Date().toISOString() }
+  store.addOwned({ pane_id: paneId, owner: ctx.from, kind: 'shell', name: name || id, created_at: now() })
+  const timeout = monitor ? Math.max(1000, Math.min(1800000, Number(timeoutMs) || 300000)) : null
+  const bg = {
+    id,
+    herdr_id: id,
+    pane_id: paneId,
+    owner: ctx.from,
+    command,
+    name: name || null,
+    description: description ?? null,
+    shell,
+    monitor: Boolean(monitor),
+    deadline: timeout ? new Date(Date.now() + timeout).toISOString() : null,
+    output_file: store.bgFile(id, '.log'),
+    exit_path: store.bgFile(id, '.exit'),
+    lines_seen: 0,
+    status: 'running',
+    started_at: now(),
+  }
   store.putBg(bg)
-  await runJson(['pane', 'rename', paneId, `bg:${(name || command).slice(0, 30)}`]).catch(() => {})
-  await runJson(['pane', 'run', paneId, wrapCommand(id, command)])
+  await runJson(['pane', 'rename', paneId, `${monitor ? 'mon' : 'bg'}:${(description || name || command).slice(0, 30)}`]).catch(() => {})
+  await runJson(['pane', 'run', paneId, line])
   return { bg }
 }
 
-const EXIT_MARK = /\[herdr-bg-exit:([A-Za-z0-9_-]+):(-?\d*):(True|False)\]/
+function readLog(path) {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return ''
+  }
+}
 
+/** A background command's status from its exit file; a monitor's new lines since the last look. */
 export async function bgStatus(ctx, { id, lines = 60 }) {
   const store = storeFor(requireWorkspace(ctx))
   const bg = store.getBg(String(id))
@@ -669,33 +1362,34 @@ export async function bgStatus(ctx, { id, lines = 60 }) {
   if (bg.status !== 'running') {
     return { bg }
   }
-  let text = ''
-  try {
-    text = await runText(['pane', 'read', bg.pane_id, '--source', 'recent-unwrapped', '--lines', String(Math.max(20, Math.min(400, Number(lines) || 60)))])
-  } catch (error) {
-    const gone = { ...bg, status: 'lost', error: String(error.message ?? error) }
-    store.putBg(gone)
-    return { bg: gone }
+  let next = bg
+  const fresh = []
+  if (bg.monitor) {
+    const all = readLog(bg.output_file).split(/\r?\n/)
+    const complete = all.slice(0, -1)
+    if (complete.length > (bg.lines_seen ?? 0)) {
+      fresh.push(...complete.slice(bg.lines_seen ?? 0))
+      next = { ...next, lines_seen: complete.length }
+    }
   }
-  // The echoed command line holds the template ("$LASTEXITCODE:$?"), which the
-  // pattern cannot match; only the expanded marker printed at exit does.
-  const real = [...text.matchAll(new RegExp(EXIT_MARK.source, 'g'))].find(match => match[1] === bg.id)
-  if (real) {
-    const done = { ...bg, status: 'exited', exit_code: real[2] === '' ? (real[3] === 'True' ? 0 : 1) : Number(real[2]), ended_at: new Date().toISOString() }
-    store.putBg(done)
-    return { bg: done, tail: text.slice(-4000) }
+  if (existsSync(bg.exit_path)) {
+    const code = Number.parseInt(readLog(bg.exit_path).trim(), 10)
+    next = { ...next, status: 'exited', exit_code: Number.isNaN(code) ? null : code, ended_at: now() }
+  } else if (bg.deadline && Date.now() > Date.parse(bg.deadline)) {
+    await runJson(['pane', 'send-keys', bg.pane_id, 'ctrl+c']).catch(() => {})
+    await closePane(ctx, { pane: bg.pane_id }).catch(() => {})
+    next = { ...next, status: 'timeout', ended_at: now() }
+  } else {
+    const pane = await runJson(['pane', 'get', bg.pane_id]).catch(() => null)
+    if (!pane?.pane) {
+      next = { ...next, status: 'lost', ended_at: now() }
+    }
   }
-  return { bg, tail: text.slice(-4000) }
-}
-
-export async function bgRead(ctx, { id, lines = 200 }) {
-  const store = storeFor(requireWorkspace(ctx))
-  const bg = store.getBg(String(id))
-  if (!bg) {
-    throw new BridgeError('no_bg', `no background command ${id}`)
+  if (next !== bg) {
+    store.putBg(next)
   }
-  const text = await runText(['pane', 'read', bg.pane_id, '--source', 'recent-unwrapped', '--lines', String(Math.max(1, Math.min(400, Number(lines) || 200)))])
-  return { bg, text: text.replace(/\s+$/, '') }
+  const tail = readLog(bg.output_file).split(/\r?\n/).slice(-Math.max(1, Math.min(400, Number(lines) || 60))).join('\n')
+  return { bg: next, tail, new_lines: fresh }
 }
 
 export async function bgStop(ctx, { id, close = false }) {
@@ -710,7 +1404,7 @@ export async function bgStop(ctx, { id, close = false }) {
   let stopped = bg
   if (bg.status === 'running') {
     await runJson(['pane', 'send-keys', bg.pane_id, 'ctrl+c']).catch(() => {})
-    stopped = { ...bg, status: 'stopped', ended_at: new Date().toISOString() }
+    stopped = { ...bg, status: 'stopped', ended_at: now() }
     store.putBg(stopped)
   }
   if (close) {
@@ -727,22 +1421,44 @@ export function bgList(ctx) {
 // One-call view for the Claude mod's poll ----------------------------------------
 
 /**
- * Agents, this workspace's lease, the caller's recent jobs (reconciled) and
- * the status of the caller's running background commands, in one process.
+ * Agents, this workspace's lease, the caller's jobs (reconciled, with their
+ * messages and events), its herdr workers and its background commands, in one
+ * process. It also moves things on: a worker that was blocked at start and is
+ * now idle gets its queued job.
  */
 export async function snapshot(ctx, { bg = true } = {}) {
   const agents = await listAgents(ctx)
   const store = storeFor(requireWorkspace(ctx))
-  const jobs = store.listJobs()
-    .filter(job => !ctx.from || job.from === ctx.from || job.to === ctx.from)
-    .slice(0, 20)
-  const reconciled = await Promise.all(jobs.map(job => reconcile(store, job)))
-  const running = bg ? store.listBg().filter(one => one.owner === ctx.from && one.status === 'running') : []
-  const bgs = []
-  for (const one of running) {
-    bgs.push((await bgStatus(ctx, { id: one.id, lines: 40 })).bg)
+  const workers = store.listWorkers().filter(one => one.owner === ctx.from)
+  for (const worker of workers.filter(one => one.status === 'blocked' && one.pane_id)) {
+    const pane = agents.find(one => one.pane_id === worker.pane_id)
+    if (pane && (pane.status === 'idle' || pane.status === 'done')) {
+      const running = { ...worker, status: 'running', note: undefined }
+      store.putWorker(running)
+      await pump({ worker: running, paneId: running.pane_id, kind: running.worker_kind }).catch(() => null)
+    }
   }
-  return { agents, lease: store.getLease(), jobs: reconciled, bg: bgs }
+  const list = store.listJobs().filter(job => !ctx.from || job.from === ctx.from || job.to === ctx.from)
+  const shown = [...list.filter(job => ACTIVE_JOB.has(job.status)), ...list.filter(job => !ACTIVE_JOB.has(job.status)).slice(0, 20)]
+  const reconciled = await Promise.all(shown.map(job => reconcile(store, job)))
+  const bgs = []
+  if (bg) {
+    for (const one of store.listBg().filter(row => row.owner === ctx.from && row.status === 'running')) {
+      const status = await bgStatus(ctx, { id: one.id, lines: 1 })
+      bgs.push({ ...status.bg, new_lines: status.new_lines })
+    }
+  }
+  const jobsByWorker = new Map()
+  for (const job of reconciled) {
+    if (job.worker) {
+      jobsByWorker.set(job.worker, [...(jobsByWorker.get(job.worker) ?? []), job])
+    }
+  }
+  const view = store.listWorkers().filter(one => one.owner === ctx.from).slice(0, 30).map(worker => {
+    const own = jobsByWorker.get(worker.herdr_id) ?? []
+    return { ...worker, job: own.find(job => OPEN_JOB.has(job.status))?.job_id ?? null, queued: jobsFor({ worker, paneId: worker.pane_id ?? '' }).filter(({ job }) => job.status === 'queued').length }
+  })
+  return { agents, lease: store.getLease(), jobs: reconciled, bg: bgs, workers: view, runtime: runtimeRoot(), panes_dir: store.panesDir }
 }
 
 // Codex launch arguments (one source for herdr-codex.ps1 and spawn) ---------------

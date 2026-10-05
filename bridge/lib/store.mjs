@@ -22,7 +22,19 @@ export function readJson(path, fallback) {
 export function writeJson(path, value) {
   const tmp = `${path}.${process.pid}.${randomBytes(3).toString('hex')}.tmp`
   writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
-  renameSync(tmp, path)
+  // Windows refuses a rename over a file another process (a reader, a virus
+  // scanner) holds open for a moment: retry briefly before giving up.
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(tmp, path)
+      return
+    } catch (error) {
+      if (attempt >= 20 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) {
+        throw error
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+    }
+  }
 }
 
 export function newId(prefix) {
@@ -38,6 +50,59 @@ export class Store {
     this.resultsDir = ensure(join(this.dir, 'results'))
     this.tasksDir = ensure(join(this.dir, 'tasks'))
     this.bgDir = ensure(join(this.dir, 'bg'))
+    this.workersDir = ensure(join(this.dir, 'workers'))
+    this.outDir = ensure(join(this.dir, 'out'))
+    this.panesDir = ensure(join(this.dir, 'panes'))
+  }
+
+  // Workers started under a herdr id (Agent takeover, herdr_worker_spawn) --
+
+  workerPath(id) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+      throw new Error(`invalid worker id: ${id}`)
+    }
+    return join(this.workersDir, `${id}.json`)
+  }
+
+  getWorker(id) {
+    return readJson(this.workerPath(id), null)
+  }
+
+  putWorker(worker) {
+    writeJson(this.workerPath(worker.herdr_id), { ...worker, updated_at: new Date().toISOString() })
+  }
+
+  listWorkers() {
+    return readdirSync(this.workersDir)
+      .filter(name => name.endsWith('.json'))
+      .map(name => readJson(join(this.workersDir, name), null))
+      .filter(Boolean)
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+  }
+
+  /** The Markdown log a herdr id's outputFile points at (what the model Reads). */
+  outputPath(id) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+      throw new Error(`invalid output id: ${id}`)
+    }
+    return join(this.outDir, `${id}.md`)
+  }
+
+  /** The screen file of any pane: refreshed when the model Reads it. */
+  panePath(paneId) {
+    const safe = String(paneId).replace(/:/g, '-')
+    if (!/^[A-Za-z0-9_-]+$/.test(safe)) {
+      throw new Error(`invalid pane id: ${paneId}`)
+    }
+    return join(this.panesDir, `${safe}.txt`)
+  }
+
+  /** A background command's own files: script, runner, log, exit code. */
+  bgFile(id, suffix) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+      throw new Error(`invalid background id: ${id}`)
+    }
+    return join(this.bgDir, `${id}${suffix}`)
   }
 
   // Jobs ---------------------------------------------------------------

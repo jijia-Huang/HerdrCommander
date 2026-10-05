@@ -7,6 +7,7 @@ export type BridgeCall = { command: string; args: Record<string, unknown>; flags
 export type World = {
   bridge: BridgeCall[]
   tools: string[]
+  agentTypes: string[]
   commands: string[]
   opened: string[]
   closed: string[]
@@ -35,7 +36,7 @@ export function fromBase64(text: string): string {
   return new TextDecoder().decode(new Uint8Array(bytes))
 }
 
-export const HERDR_ENV = { HERDR_ENV: '1', HERDR_PANE_ID: 'wA:p1', HERDR_WORKSPACE_ID: 'wA' }
+export const HERDR_ENV = { HERDR_ENV: '1', HERDR_PANE_ID: 'wA:p1', HERDR_WORKSPACE_ID: 'wA', HERDR_BRIDGE_RUNTIME: 'C:/rt' }
 
 export const AGENTS = [
   { pane_id: 'wA:p1', name: null, kind: 'claude', status: 'working', title: 'me', cwd: 'D:\\work', workspace_id: 'wA', role: 'plain', job_id: null, owned_by: null, is_self: true, focused: true },
@@ -47,13 +48,14 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
   const world: World = {
     bridge: [],
     tools: [],
+    agentTypes: [],
     commands: [],
     opened: [],
     closed: [],
     toasts: [],
     statuses: [],
     replies: {
-      snapshot: { agents: AGENTS, lease: null, jobs: [], bg: [] },
+      snapshot: { agents: AGENTS, lease: null, jobs: [], bg: [], workers: [], panes_dir: 'C:/rt/wA/panes' },
       agents: AGENTS,
       claim: { claimed: true, holder: { pane_id: 'wA:p1', kind: 'claude' } },
       release: { released: true },
@@ -90,6 +92,11 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
   on('tool.register', ($, e) => {
     world.tools.push(e.name)
     return { value: { tool: `mcp__herdr-commander__${e.name}` } }
+  })
+
+  on('agent.register', ($, e) => {
+    world.agentTypes.push(e.name)
+    return { value: { agent: `herdr-commander:${e.name}` } } as never
   })
 
   on('command.register', ($, e) => {
