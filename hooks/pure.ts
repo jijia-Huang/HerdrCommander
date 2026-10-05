@@ -298,8 +298,9 @@ export function notices(self: string, jobs: readonly JobRow[], bg: readonly BgRo
         const cut = text.length > MESSAGE_ROOM ? `${text.slice(0, MESSAGE_ROOM)}\n[… cut; the whole message is in ${output || job.resultPath}]` : text
         lines.push(`${label} sent you a message (job ${job.jobId}):\n${cut}`)
       } else if (event.type === 'completed') {
+        const how = event.via === 'message' ? 'it sent you its message and stopped.' : `${job.summary || '(no summary)'} — result file: ${job.resultPath} (Read it).`
         lines.push(job.worker
-          ? `${label} finished job ${job.jobId}: it sent you its message and stopped.${file} SendMessage to ${id} continues the same job; TaskStop ${id} closes its pane.`
+          ? `${label} finished job ${job.jobId}: ${how}${event.via === 'message' ? file : ''} SendMessage to ${id} continues the same job; TaskStop ${id} closes its pane.`
           : `${label} completed job ${job.jobId}: ${job.summary || '(no summary)'} — result file: ${job.resultPath}`)
       } else if (event.type === 'stopped_without_message') {
         lines.push(`${label} stopped, but has not sent you a message for job ${job.jobId} yet.${file} SendMessage to ${id} to answer it or nudge it (same job), or TaskStop ${id}.`)
@@ -357,7 +358,8 @@ export function agentLine(row: AgentRow, width: number, now: number): string {
 }
 
 export function panePath(panesDir: string, paneId: string): string {
-  return `${panesDir}/${paneId.replace(/:/g, '-')}.txt`
+  const sep = panesDir.includes('\\') ? '\\' : '/'
+  return `${panesDir}${sep}${paneId.replace(/:/g, '-')}.txt`
 }
 
 /** The herdr part of ListAgents: this pane's herdr workers, then every other herdr pane with its screen file. */

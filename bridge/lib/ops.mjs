@@ -632,7 +632,7 @@ async function finishJob(store, job) {
     done.summary = String(last?.text ?? '').split(/\r?\n/).find(line => line.trim() !== '')?.trim().slice(0, 200) ?? ''
     writeFileSync(job.result_path, `job_id: ${job.job_id}\n\n${sent.map(one => one.text).join('\n\n---\n\n')}\n`, 'utf8')
   }
-  const marked = withEvent(done, 'completed')
+  const marked = withEvent(done, 'completed', { via: job.completed_via })
   store.putJob(marked)
   const out = await onCompleted(store, marked)
   writeWorkerOutput(out.worker)
@@ -1113,6 +1113,9 @@ function writeWorkerOutput(herdrId, screen = null) {
     lines.push('', `## Job ${job.job_id} (${job.status}) from ${job.from}`, '', '### Task', '', job.body)
     for (const one of job.messages ?? []) {
       lines.push('', `### ${stamp(one.at)} ${one.from === 'worker' ? 'worker → sender' : 'sender → worker'}`, '', one.text)
+    }
+    if (job.status === 'completed' && job.completed_via !== 'message' && existsSync(job.result_path)) {
+      lines.push('', `### Result (${job.result_path})`, '', readFileSync(job.result_path, 'utf8').slice(0, 20000))
     }
   }
   if (screen !== null) {

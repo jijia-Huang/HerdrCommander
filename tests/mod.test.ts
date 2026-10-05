@@ -375,7 +375,7 @@ describe('pure helpers', () => {
     const job: JobRow = {
       jobId: 'job-1', from: 'wA:p1', to: 'wA:p9', worker: worker.herdrId, kind: 'task', status: 'completed', summary: 'done', body: 'x', resultPath: 'r.md',
       messages: [{ seq: 2, from: 'worker', text: 'Result: all 3 tests pass' }],
-      events: [{ seq: 1, type: 'stopped_without_message', at: 't' }, { seq: 3, type: 'message', at: 't', message_seq: 2 }, { seq: 4, type: 'completed', at: 't' }],
+      events: [{ seq: 1, type: 'stopped_without_message', at: 't' }, { seq: 3, type: 'message', at: 't', message_seq: 2 }, { seq: 4, type: 'completed', at: 't', via: 'message' }],
     }
     const theirs: JobRow = { ...job, jobId: 'job-2', from: 'wA:p5' }
     const bg = [{ id: 'herdr-bg-wA-1', paneId: 'wA:p8', command: 'npm test', status: 'exited', exitCode: 1, outputFile: 'C:/rt/bg.log', monitor: false, description: '', newLines: [] }]

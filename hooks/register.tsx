@@ -408,21 +408,26 @@ async function choose($: EngineInterface, paneId: string): Promise<void> {
  * permission chain native would ask (`$.tool.check`): deny stays a deny, ask
  * goes back to native (which then asks), allow goes to herdr. Null: native.
  */
-async function backgroundInPane($: EngineInterface, tool: 'Bash' | 'PowerShell' | 'Monitor', input: Record<string, unknown>, args: Record<string, unknown>): Promise<{ deny: string } | { bg: { id: string; pane_id: string; output_file: string } } | null> {
+async function backgroundInPane($: EngineInterface, tool: 'Bash' | 'PowerShell' | 'Monitor', input: Record<string, unknown>, args: Record<string, unknown>): Promise<{ deny: string } | { bg: { id: string; pane_id: string; output_file: string } } | { native: string }> {
   const verdict = await $.tool.check({ tool, input })
   if (verdict.decision === 'deny') {
     return { deny: verdict.reason ?? `${tool} denied` }
   }
   if (verdict.decision !== 'allow') {
-    return null
+    return { native: `the permission check said "${verdict.decision}"${verdict.reason ? ` (${verdict.reason})` : ''}, so Claude Code ran it itself` }
   }
   try {
     const out = await bridge<{ bg: { id: string; pane_id: string; output_file: string } }>($, 'bg-run', { ...args, cwd: await $.session.cwd() })
     await ensurePolling($)
     return out
-  } catch {
-    return null
+  } catch (error) {
+    return { native: `herdr could not start it (${errorText(error)}), so Claude Code ran it itself` }
   }
+}
+
+/** Native result of a background call herdr did not take, with why (for the model, and for checking). */
+function withWhy<T extends { deny?: unknown; context?: readonly string[] }>(ran: T, why: string): T {
+  return ran.deny !== undefined ? ran : { ...ran, context: [...(ran.context ?? []), `herdr: not in a herdr pane: ${why}.`] }
 }
 
 function bgContext(out: { bg: { id: string; pane_id: string; output_file: string } }, isMonitor: boolean): string {
@@ -497,7 +502,7 @@ export const register: Register = (on, rawOptions) => {
     if (role === 'commander') {
       startPreview($)
       await ensurePolling($)
-    } else if ((await $.store.get('lastRole')) === 'commander') {
+    } else if (role !== 'worker' && (await $.store.get('lastRole')) === 'commander') {
       $.ui.status('herdr: /commander to resume the commander role')
     }
     if (options.lifecycleReport) {
@@ -727,8 +732,8 @@ export const register: Register = (on, rawOptions) => {
         return next(e)
       }
       const out = await backgroundInPane($, 'Bash', { command: e.command, description: e.description, run_in_background: true }, { command: e.command, shell: 'bash', description: e.description })
-      if (out === null) {
-        return next(e)
+      if ('native' in out) {
+        return withWhy(await next(e), out.native)
       }
       if ('deny' in out) {
         return out
@@ -742,8 +747,8 @@ export const register: Register = (on, rawOptions) => {
         return next(e)
       }
       const out = await backgroundInPane($, 'PowerShell', { command: e.command, description: e.description, run_in_background: true }, { command: e.command, shell: 'powershell', description: e.description })
-      if (out === null) {
-        return next(e)
+      if ('native' in out) {
+        return withWhy(await next(e), out.native)
       }
       if ('deny' in out) {
         return out
@@ -757,8 +762,8 @@ export const register: Register = (on, rawOptions) => {
         return next(e)
       }
       const out = await backgroundInPane($, 'Monitor', { command: e.command, description: e.description, timeout_ms: e.timeout_ms }, { command: e.command, shell: 'bash', monitor: true, timeout_ms: e.timeout_ms, description: e.description })
-      if (out === null) {
-        return next(e)
+      if ('native' in out) {
+        return withWhy(await next(e), out.native)
       }
       if ('deny' in out) {
         return out
