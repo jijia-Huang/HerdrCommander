@@ -1,0 +1,6 @@
+# runtime data written by herdr-bridge (jobs, results, task files, lease, owned panes)
+.runtime/
+# laid by the Claude Code engine each time it loads the mod
+claude-mod/.claude-plugin/types/
+# crash dumps from Git Bash
+*.stackdump

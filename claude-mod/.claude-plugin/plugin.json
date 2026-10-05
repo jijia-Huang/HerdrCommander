@@ -1,0 +1,63 @@
+{
+  "name": "herdr-commander",
+  "version": "0.1.0",
+  "description": "Inside herdr: commander pane, herdr-backed lifecycle, notifications and cross-agent jobs via herdr-bridge; outside herdr it does nothing",
+  "author": { "name": "jijiahuang" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "lifecycleReport": {
+      "type": "boolean",
+      "title": "Report state to herdr",
+      "description": "Report this pane's working/blocked/idle state to herdr (pane report-agent) instead of herdr reading the screen.",
+      "default": true
+    },
+    "notifications": {
+      "type": "boolean",
+      "title": "Commander notifications",
+      "description": "As commander, notify (herdr notification + toast) when another agent becomes blocked or finishes.",
+      "default": true
+    },
+    "listAgentsAugment": {
+      "type": "boolean",
+      "title": "ListAgents shows herdr agents",
+      "description": "Append the herdr agents to the ListAgents tool's result.",
+      "default": true
+    },
+    "sendMessageRoute": {
+      "type": "boolean",
+      "title": "SendMessage reaches herdr agents",
+      "description": "A SendMessage to a herdr pane id or agent name becomes a tracked herdr job.",
+      "default": true
+    },
+    "pushNotificationMirror": {
+      "type": "boolean",
+      "title": "Mirror PushNotification to herdr",
+      "description": "Also show PushNotification as a herdr notification.",
+      "default": true
+    },
+    "backgroundTools": {
+      "type": "boolean",
+      "title": "Background commands in herdr panes (P2)",
+      "description": "Add herdr_bg_run/read/stop and steer long background shell commands into visible herdr panes.",
+      "default": false
+    },
+    "agentPanes": {
+      "type": "boolean",
+      "title": "Background agents in herdr panes (P3)",
+      "description": "Add herdr_agent_spawn and steer long background agent work into visible herdr worker panes.",
+      "default": false
+    },
+    "deliverFlow": {
+      "type": "boolean",
+      "title": "/deliver through herdr (P4)",
+      "description": "When the deliver skill runs inside herdr, add the herdr-pane flavour of the pipeline.",
+      "default": false
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Poll interval (seconds)",
+      "description": "How often the agent list is refreshed (2-60). One herdr call takes about a second.",
+      "default": 3
+    }
+  }
+}
