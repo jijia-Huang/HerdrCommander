@@ -19,7 +19,7 @@ claude plugin install herdr-commander@herdr-commander
 
 裝好後所有 Claude session 都會載入它，但**不在 herdr 裡時完全不生效**（每個 hook 都先檢查 `HERDR_ENV`／`HERDR_PANE_ID`）。
 
-更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.2.2`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
+更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.2.3`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
 
 ```powershell
 claude plugin update herdr-commander@herdr-commander
@@ -82,6 +82,18 @@ worker 中途用 SendMessage 傳給 main 的訊息照樣立刻轉給派工者（
 
 Codex 端不變：Codex commander／worker 照舊用 `bridge/mcp.mjs` 的 MCP 工具（`herdr_job_complete`、結果檔帶 `job_id:` 檔頭）。排隊、重新打開 job 由 bridge 處理，Codex 一樣適用。
 
+### 換對話（`/resume`、`/clear`）之後照樣在 herdr 裡（0.2.3 起）
+
+mod 的狀態（`$.state`）是跟著對話走的，而 `session.start` 每個程序只在啟動時跑一次。所以「程序先啟動、再切到別的對話」時（先開 `claude` 再 `/resume`、不帶 id 的 `claude --resume` 選單、`/clear`），新對話的狀態是空的。0.2.2 以前這時會一直以為「不在 herdr 裡」，Agent、SendMessage、ListAgents、`/commander` 全部無聲地退回原生。
+
+0.2.3 起：
+- 讀到「不在 herdr」時，會再看一次這個程序的環境變數（`HERDR_ENV`、`HERDR_PANE_ID` 等，程序內只讀一次），在 herdr 裡就當場補回來。
+- commander 角色看 bridge 的 lease：lease 還是這個 pane 的，就恢復 commander（擋編輯、輪詢、面板）。
+- 換對話時（`session.end` 的 `reason` 是 `clear` 或 `resume`）不釋放 lease，也不通知 herdr「agent 走了」，因為程序還在；真正離開（`/exit` 等）才釋放。
+- 新對話的模型會重新收到一次 herdr 說明；輪詢重新開始，派出去還沒完成的 worker 的通知照樣會送到。
+- 代價：剛好在切換那一刻發生的 job 事件，兩邊對話都不會收到通知（新對話會先把現有事件記成「已看過」，避免把舊通知全部重送一次）。
+- 換過去之後，畫面上原本的 Commander 面板會先顯示空的，等新對話第一個動作（送出提示或叫用工具）才更新。
+
 ### Codex 當 commander 或 worker
 
 ```powershell
@@ -125,7 +137,7 @@ Claude 與 Codex 共用同一份 lease（`<runtime>/<workspace>/lease.json`）�
 
 ```powershell
 cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 50 項，假 herdr，不碰實機
-cd ..; claude plugin validate .; claude plugin test .                            # 30 項；validate 也會檢查 marketplace.json
+cd ..; claude plugin validate .; claude plugin test .                            # 34 項；validate 也會檢查 marketplace.json
 ```
 
 在 herdr 的 worker pane 裡跑測試時，要先清掉 `HERDR_*` 環境變數（Git Bash：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_COMMANDER_ROLE ...`），否則 bridge 會把測試本身當成 worker，開 worker 的測試會失敗。

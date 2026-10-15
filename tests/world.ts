@@ -66,6 +66,7 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
   }
 
   on('session.start', () => ({ cwd: 'D:\work' }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('env.get', ($, e) => ({ value: env[e.name] }))
   on('store.get', () => ({ value: undefined }))
   on('store.set', () => ({ value: undefined }))
@@ -129,6 +130,30 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
   on('ui.invalidate', () => ({ value: undefined }))
 
   return world
+}
+
+/**
+ * $.state as the engine keeps it, one set of values per conversation: `next()`
+ * moves the process on to another conversation (/resume, /clear), which starts
+ * with none and gets no session.start.
+ */
+export function conversations(on: On): { next: () => void } {
+  let values = new Map<string, { value: unknown; version: number }>()
+  const keyOf = (e: { plugin: string; key: string; id?: string }) => `${e.plugin}/${e.key}/${e.id ?? ''}`
+  on('state.get', ($, e) => ({ value: { value: values.get(keyOf(e))?.value, version: values.get(keyOf(e))?.version ?? 0 } }) as never)
+  on('state.set', ($, e) => {
+    const held = values.get(keyOf(e)) ?? { value: undefined, version: 0 }
+    if (e.ifVersion !== undefined && e.ifVersion !== held.version) {
+      return { value: { isSet: false, version: held.version } } as never
+    }
+    values.set(keyOf(e), { value: e.value, version: held.version + 1 })
+    return { value: { isSet: true, version: held.version + 1 } } as never
+  })
+  return {
+    next: () => {
+      values = new Map()
+    },
+  }
 }
 
 export const SESSION = { surface: 'terminal', isInteractive: true, cwd: 'D:\\work' } as const

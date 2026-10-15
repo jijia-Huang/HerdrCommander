@@ -89,6 +89,10 @@ let turnStartedAt: number | null = null
 let lastPromptAt: number | null = null
 /** The role whose herdr text this session's model has been given (prompt context; see prompt.submit). */
 let briefedRole: Role | null = null
+/** This process's herdr pane from its environment, null outside herdr; undefined until read. */
+let paneEnv: Gate | null | undefined
+/** A gate being rebuilt after a conversation switch (see gateOf), shared by the hooks that ask meanwhile. */
+let adopting: Promise<Gate> | null = null
 let runtimeRoot = ''
 let options: Options = readOptions({})
 
@@ -105,6 +109,56 @@ function later($: EngineInterface, fn: () => Promise<unknown>): void {
   $.clock.after(1, () => {
     void fn().catch(() => {})
   })
+}
+
+/** The herdr pane this process runs in, from its environment (which never changes), or null. */
+async function envPane($: EngineInterface): Promise<Gate | null> {
+  if (paneEnv === undefined) {
+    const isHerdr = (await $.env.get('HERDR_ENV')) === '1'
+    const paneId = (await $.env.get('HERDR_PANE_ID')) ?? ''
+    const workspaceId = (await $.env.get('HERDR_WORKSPACE_ID')) ?? paneId.split(':')[0] ?? ''
+    const role: Role = (await $.env.get('HERDR_COMMANDER_ROLE')) === 'worker' ? 'worker' : 'plain'
+    paneEnv = isHerdr && paneId !== '' && workspaceId !== '' ? { inHerdr: true, paneId, workspaceId, role } : null
+  }
+  return paneEnv
+}
+
+/**
+ * This conversation's gate. $.state belongs to the conversation, and a
+ * /resume or /clear in a running process starts a new one with no
+ * session.start: an empty gate inside herdr is rebuilt from the environment,
+ * the commander role from the bridge's lease (this pane still holds it).
+ */
+async function gateOf($: EngineInterface): Promise<Gate> {
+  const g = await read($, stGate)
+  if (g.inHerdr) {
+    return g
+  }
+  const pane = await envPane($)
+  if (pane === null) {
+    return g
+  }
+  adopting ??= adopt($, pane).finally(() => {
+    adopting = null
+  })
+  return adopting
+}
+
+async function adopt($: EngineInterface, pane: Gate): Promise<Gate> {
+  await update($, stGate, () => pane)
+  if (pane.role === 'worker') {
+    return pane
+  }
+  const held = await bridge<{ lease: { pane_id: string } | null }>($, 'lease', {}, false, 8000).catch(() => null)
+  const g: Gate = held?.lease?.pane_id === pane.paneId ? { ...pane, role: 'commander' } : pane
+  if (g.role === 'commander') {
+    await update($, stGate, () => g)
+    startPreview($)
+  }
+  // The switch stopped the poll; work sent out before it may still be running
+  // (runTick stops again when nothing is).
+  await ensurePolling($)
+  return g
 }
 
 /**
@@ -134,7 +188,7 @@ async function agentsNow($: EngineInterface): Promise<AgentRow[]> {
   if (rows.length > 0) {
     return rows
   }
-  const g = await read($, stGate)
+  const g = await gateOf($)
   return toRows(await bridge<RawAgent[]>($, 'agents'), [], g.paneId, await $.clock.now())
 }
 
@@ -159,7 +213,7 @@ function launchedContext(out: NewWorker): string {
 
 /** Polls while there is something to watch: the commander role, or work this pane sent out. */
 async function ensurePolling($: EngineInterface): Promise<void> {
-  const g = await read($, stGate)
+  const g = await gateOf($)
   if (!g.inHerdr) {
     return
   }
@@ -184,7 +238,7 @@ function stopPolling(): void {
 
 async function runTick($: EngineInterface): Promise<void> {
   await tick($)
-  const g = await read($, stGate)
+  const g = await gateOf($)
   if (g.role === 'commander') {
     return
   }
@@ -197,7 +251,7 @@ async function runTick($: EngineInterface): Promise<void> {
 
 /** Applies a bridge snapshot to the atoms; returns the rows before and after. */
 async function absorb($: EngineInterface, snap: Snapshot): Promise<{ before: AgentRow[]; rows: AgentRow[]; jobRows: JobRow[]; workerRows: WorkerRow[] }> {
-  const g = await read($, stGate)
+  const g = await gateOf($)
   const now = await $.clock.now()
   const before = await read($, stAgents)
   const rows = toRows(snap.agents, before, g.paneId, now)
@@ -223,7 +277,7 @@ async function absorb($: EngineInterface, snap: Snapshot): Promise<{ before: Age
 }
 
 async function tick($: EngineInterface): Promise<void> {
-  const g = await read($, stGate)
+  const g = await gateOf($)
   if (!g.inHerdr || ticking) {
     return
   }
@@ -303,7 +357,7 @@ function startPreview($: EngineInterface): void {
 }
 
 async function refreshPreview($: EngineInterface): Promise<void> {
-  const g = await read($, stGate)
+  const g = await gateOf($)
   if (g.role !== 'commander') {
     return
   }
@@ -336,7 +390,7 @@ async function registerSpawnTool($: EngineInterface, role: Role): Promise<void> 
 }
 
 async function enterCommander($: EngineInterface): Promise<string> {
-  const g = await read($, stGate)
+  const g = await gateOf($)
   if (!g.inHerdr) {
     return 'Not inside herdr; /commander does nothing here.'
   }
@@ -360,7 +414,7 @@ async function enterCommander($: EngineInterface): Promise<string> {
 }
 
 async function leaveCommander($: EngineInterface): Promise<string> {
-  const g = await read($, stGate)
+  const g = await gateOf($)
   if (g.role !== 'commander') {
     return 'This pane is not the commander.'
   }
@@ -407,7 +461,7 @@ export const register: Register = (on, rawOptions) => {
   // The one tool: a herdr worker in another folder ---------------------------------
 
   on('tool.call', { tool: /^mcp__herdr-commander__herdr_worker_spawn$/ }, async ($, e) => {
-    const g = await read($, stGate)
+    const g = await gateOf($)
     const why = mayCreate(g, e.agentId)
     if (why) {
       return { deny: `herdr_worker_spawn: ${why}` }
@@ -434,18 +488,15 @@ export const register: Register = (on, rawOptions) => {
   // Session start: the gate ------------------------------------------------------------
 
   on('session.start', async ($, e, next) => {
-    const isHerdr = (await $.env.get('HERDR_ENV')) === '1'
-    const paneId = (await $.env.get('HERDR_PANE_ID')) ?? ''
-    const workspaceId = (await $.env.get('HERDR_WORKSPACE_ID')) ?? paneId.split(':')[0] ?? ''
-    if (!isHerdr || paneId === '' || workspaceId === '') {
+    const pane = await envPane($)
+    if (pane === null) {
       await update($, stGate, () => OFF_GATE)
       return next(e)
     }
     // A reload keeps $.state: a pane that was the commander stays one.
     const previous = await read($, stGate)
-    const envRole = (await $.env.get('HERDR_COMMANDER_ROLE')) === 'worker' ? 'worker' : 'plain'
-    const role: Role = previous.inHerdr && previous.paneId === paneId && previous.role === 'commander' ? 'commander' : envRole
-    const g: Gate = { inHerdr: true, paneId, workspaceId, role }
+    const role: Role = previous.inHerdr && previous.paneId === pane.paneId && previous.role === 'commander' ? 'commander' : pane.role
+    const g: Gate = { ...pane, role }
     await update($, stGate, () => g)
     runtimeRoot = runtimeRootOf({
       runtime: await $.env.get('HERDR_BRIDGE_RUNTIME'),
@@ -476,10 +527,26 @@ export const register: Register = (on, rawOptions) => {
   })
 
   on('session.end', async ($, e, next) => {
-    const g = await read($, stGate)
+    let g = await read($, stGate)
+    const pane = await envPane($)
+    if (!g.inHerdr && pane !== null) {
+      // A conversation switched to and left before any hook took it up: the
+      // pane is still this one (the lease, if it held one, frees itself once
+      // this agent is gone).
+      g = pane
+      await update($, stGate, () => pane)
+    }
     if (g.inHerdr) {
       stopPolling()
       previewTimer?.cancel()
+      if (e.reason === 'clear' || e.reason === 'resume') {
+        // The process goes on in another conversation (gateOf takes it up
+        // there): the pane keeps its herdr state and lease, and that
+        // conversation's model is briefed and its notices seeded afresh.
+        briefedRole = null
+        seeded = false
+        return next(e)
+      }
       if (options.lifecycleReport) {
         await bridge($, 'release-agent', { agent: 'claude' }, false, 8000).catch(() => {})
       }
@@ -498,7 +565,7 @@ export const register: Register = (on, rawOptions) => {
   // not enough. A worker gets it with every prompt, since its work arrives as
   // plain messages; the other roles once per role.
   on('prompt.submit', async ($, e, next) => {
-    const g = await read($, stGate)
+    const g = await gateOf($)
     if (!g.inHerdr) {
       return next(e)
     }
@@ -522,7 +589,7 @@ export const register: Register = (on, rawOptions) => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    const g = await read($, stGate)
+    const g = await gateOf($)
     if (g.inHerdr && !e.agentId) {
       if (options.lifecycleReport) {
         want($, 'idle')
@@ -547,7 +614,7 @@ export const register: Register = (on, rawOptions) => {
     // Blocked only while a permission dialog is really up. (A tool.check "ask"
     // is not that: auto mode's classifier or a rule may settle it unseen.)
     on('classic.PermissionRequest', async ($, e, next) => {
-      if ((await read($, stGate)).inHerdr) {
+      if ((await gateOf($)).inHerdr) {
         awaitingPermission = true
         want($, 'blocked')
       }
@@ -558,7 +625,7 @@ export const register: Register = (on, rawOptions) => {
   // Every tool call: dialogs block, the commander's own edits are refused,
   // PushNotification gets its herdr side. Registered first: the outer hook.
   on('tool.call', async ($, e, next) => {
-    const g = await read($, stGate)
+    const g = await gateOf($)
     if (!g.inHerdr) {
       return next(e)
     }
@@ -592,7 +659,7 @@ export const register: Register = (on, rawOptions) => {
     // types never run in-process: when herdr cannot take them, the call is refused.
     on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
       const kind = herdrKind(e.subagent_type)
-      const g = await read($, stGate)
+      const g = await gateOf($)
       if (!kind || !g.inHerdr) {
         return next(e)
       }
@@ -624,7 +691,7 @@ export const register: Register = (on, rawOptions) => {
     // SendMessage: a worker's reply to whoever gave it the job, or a message to a
     // herdr worker / agent / pane (a tracked job). Anything else is Claude's own.
     on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
-      const g = await read($, stGate)
+      const g = await gateOf($)
       const to = typeof e.to === 'string' ? e.to : null
       if (!g.inHerdr || e.agentId || to === null || typeof e.message !== 'string' || e.message.trim() === '') {
         return next(e)
@@ -646,7 +713,7 @@ export const register: Register = (on, rawOptions) => {
     // TaskStop of a herdr id (or the name / pane of a worker this pane started):
     // Ctrl+C and close the pane, without asking, as native TaskStop does.
     on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
-      const g = await read($, stGate)
+      const g = await gateOf($)
       const id = String(e.task_id ?? e.shell_id ?? '')
       const workers = await read($, stWorkers)
       const ours = id.startsWith('herdr-') || PANE_ID.test(id) || workers.some(one => one.name === id || one.agentName === id)
@@ -668,7 +735,7 @@ export const register: Register = (on, rawOptions) => {
     // ListAgents: native peers, then this pane's herdr workers and the other herdr panes.
     on('tool.call', { tool: 'ListAgents' }, async ($, e, next) => {
       const ran = await next(e)
-      const g = await read($, stGate)
+      const g = await gateOf($)
       if (!g.inHerdr || ran.deny !== undefined) {
         return ran
       }
@@ -690,7 +757,7 @@ export const register: Register = (on, rawOptions) => {
     // Read of a runtime file: the bridge refreshes it first (a worker's output
     // gets its latest screen; a pane screen file is written), and it is allowed.
     on('tool.call', { tool: 'Read' }, async ($, e, next) => {
-      const g = await read($, stGate)
+      const g = await gateOf($)
       if (g.inHerdr && typeof e.file_path === 'string' && isRuntimePath(e.file_path, runtimeRoot)) {
         await bridge($, 'refresh', { path: e.file_path }, false, 20000).catch(() => null)
       }
@@ -698,7 +765,7 @@ export const register: Register = (on, rawOptions) => {
     })
 
     on('tool.check', { tool: 'Read' }, async ($, e, next) => {
-      const g = await read($, stGate)
+      const g = await gateOf($)
       const path = (e.input as { file_path?: unknown } | null)?.file_path
       if (g.inHerdr && typeof path === 'string' && isRuntimePath(path, runtimeRoot)) {
         return { decision: 'allow' as const, reason: 'herdr-commander runtime file (worker output, pane screen)' }
@@ -708,7 +775,7 @@ export const register: Register = (on, rawOptions) => {
 
     // $.session.send from other plugins follows the same rules as SendMessage.
     on('session.send', async ($, e, next) => {
-      const g = await read($, stGate)
+      const g = await gateOf($)
       if (!g.inHerdr || e.agentId) {
         return next(e)
       }
@@ -729,7 +796,7 @@ export const register: Register = (on, rawOptions) => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const g = await read($, stGate)
+    const g = await gateOf($)
     if (!g.inHerdr) {
       return composed
     }
@@ -743,7 +810,7 @@ export const register: Register = (on, rawOptions) => {
   if (options.deliverFlow) {
     on('skill.prompt', { skill: 'deliver' }, async ($, e, next) => {
       const expanded = await next(e)
-      return (await read($, stGate)).inHerdr ? { ...expanded, text: `${expanded.text}\n${DELIVER_ADDENDUM}` } : expanded
+      return (await gateOf($)).inHerdr ? { ...expanded, text: `${expanded.text}\n${DELIVER_ADDENDUM}` } : expanded
     })
   }
 

@@ -3,7 +3,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import { base64, herdrListing, isRuntimePath, notices, readOptions, toRows, transitions } from '../hooks/pure'
 import type { RawAgent } from '../hooks/pure'
 import type { JobRow, WorkerRow } from '../types'
-import { AGENTS, HERDR_ENV, PANE, SESSION, command, fromBase64, textOf, worldOf } from './world'
+import { AGENTS, HERDR_ENV, PANE, SESSION, command, conversations, fromBase64, textOf, worldOf } from './world'
 
 const COMPOSE_INPUT = { model: 'claude-test', promptModel: 'claude-test', surfaces: ['terminal' as const], tools: [], outputStyle: null, traits: [] }
 const COMPOSED = { sections: [{ id: 'intro', text: 'base prompt', scope: 'shared' as const }] }
@@ -168,6 +168,79 @@ describe('inside herdr', () => {
     expect(text.indexOf('wA:p2')).toBeLessThan(text.indexOf('wD:p2'))
     expect(text).not.toContain('wA:p1 claude')
     expect(text).toContain('[x interrupt]')
+  })
+})
+
+const ENDED = (reason: string) => ({ reason, sessionId: 'session-1', resume: { id: 'session-1' } }) as never
+
+describe('a conversation switch in the same process', () => {
+  test('/resume keeps the takeover, the herdr state and the lease, and briefs the new conversation', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const conversation = conversations(on)
+    mock.clock(on)
+    world.replies['worker-new'] = NEW_WORKER
+    world.replies.lease = { lease: null }
+    const seen: number[] = []
+    on('prompt.submit', ($, e) => {
+      seen.push((e.context ?? []).filter(text => text.includes('herdr-commander:')).length)
+      return { text: e.text } as never
+    })
+    on('tool.call', () => NATIVE as never)
+    await $.session.start(SESSION)
+    await $.prompt.submit({ text: 'first' } as never)
+    await $.prompt.submit({ text: 'second' } as never)
+
+    await $.session.end(ENDED('resume'))
+    conversation.next()
+    expect(world.bridge.some(call => ['release', 'release-agent'].includes(call.command))).toBe(false)
+    const switched = world.bridge.length
+    await $.prompt.submit({ text: 'after the resume' } as never)
+    expect(seen).toEqual([1, 0, 1])
+    // The poll starts again: work sent out before the switch may still be running.
+    expect(world.bridge.slice(switched).map(call => call.command)).toContain('snapshot')
+    const ran = await $.tool.call(CALLS.agent as never)
+    expect((ran.result as { agentId?: string }).agentId).toBe('herdr-agent-wA-abc123')
+    expect(world.bridge.find(call => call.command === 'worker-new')?.flags).toEqual(['--pane', 'wA:p1', '--workspace', 'wA', '--role', 'plain'])
+  })
+
+  test('leaving a conversation switched to before any hook ran still releases this pane', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const conversation = conversations(on)
+    mock.clock(on)
+    await $.session.start(SESSION)
+    await $.session.end(ENDED('resume'))
+    conversation.next()
+    await $.session.end(ENDED('prompt_input_exit'))
+    expect(world.bridge.find(call => call.command === 'release-agent')?.flags).toEqual(['--pane', 'wA:p1', '--workspace', 'wA', '--role', 'plain'])
+  })
+
+  test('the commander stays the commander after /clear: the bridge still has its lease', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const conversation = conversations(on)
+    mock.clock(on)
+    on('prompt.compose', () => COMPOSED)
+    on('tool.call', () => NATIVE as never)
+    await $.session.start(SESSION)
+    await $.command.run(command('commander'))
+
+    await $.session.end(ENDED('clear'))
+    conversation.next()
+    expect(world.bridge.some(call => call.command === 'release')).toBe(false)
+    world.replies.lease = { lease: { pane_id: 'wA:p1', kind: 'claude' } }
+    const denied = await $.tool.call({ tool: 'Edit', file_path: 'D:\\work\\a.txt', old_string: 'a', new_string: 'b' } as never)
+    expect(denied.deny).toContain('commander does not edit files')
+    const sections = (await $.prompt.compose(COMPOSE_INPUT)).sections
+    expect(sections.map(section => section.id)).toEqual(['intro', 'herdr-commander:env', 'herdr-commander:role'])
+  })
+
+  test('leaving the session still releases the pane and the lease', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    mock.clock(on)
+    await $.session.start(SESSION)
+    await $.command.run(command('commander'))
+    await $.session.end(ENDED('prompt_input_exit'))
+    expect(world.bridge.some(call => call.command === 'release-agent')).toBe(true)
+    expect(world.bridge.some(call => call.command === 'release')).toBe(true)
   })
 })
 
