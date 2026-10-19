@@ -13,9 +13,20 @@ import { Store, newId } from './store.mjs'
 export const SOURCE = 'herdr-commander'
 const PANE_ID = /^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/
 const NAME = /^[a-z][a-z0-9_-]{0,31}$/
-/** queued: waiting for its worker; sent / delivery_unknown: the worker's one open job. */
-const ACTIVE_JOB = new Set(['queued', 'sent', 'delivery_unknown'])
-const OPEN_JOB = new Set(['sent', 'delivery_unknown'])
+/**
+ * queued: waiting for its worker; the others: the worker's one open job.
+ * pending / sending / undeliverable are a Claude worker's job sent by Claude's
+ * cross-session messages (queueSend): waiting for the sender's mod, being
+ * sent, or not delivered (open until the sender resends or stops it).
+ */
+const ACTIVE_JOB = new Set(['queued', 'sent', 'delivery_unknown', 'pending', 'sending', 'undeliverable'])
+const OPEN_JOB = new Set(['sent', 'delivery_unknown', 'pending', 'sending', 'undeliverable'])
+/** How long a running Claude worker may go without reporting its session before its job is undeliverable. */
+const SESSION_WAIT_MS = 60000
+/** How long a send the sender's mod took may go without its result before its job is undeliverable. */
+const SEND_WAIT_MS = 60000
+/** The permission modes Claude Code takes (`claude --permission-mode`). */
+const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'])
 /** With a BOM: Windows PowerShell 5.1's Get-Content reads BOM-less files in the ANSI code page. */
 const BOM = '﻿'
 
@@ -215,6 +226,15 @@ function requireFrom(ctx) {
 // the way, completed, stopped without an answer, stopped, cancelled, start
 // failed or blocked. A Claude worker's final answer is a message too, but
 // it arrives with `completed` (one notice), not as an event of its own.
+//
+// Between a Claude worker the bridge started and a Claude sender (its mod
+// passes `from_session`, its own session id), nothing is typed: the bridge
+// keeps what to send and to which session, and the mods send it with Claude
+// Code's cross-session messages (a bridge process cannot) and report back.
+// Sender → worker: queueSend, sendTake, sendDone. Worker → sender: turnEnd and
+// reply mark their event `relay: 'sending'` and return it (notice), and
+// relayDone records how it went; the sender's mod tells it itself only when
+// that fails or takes too long.
 
 function now() {
   return new Date().toISOString()
@@ -365,6 +385,16 @@ export function directText(text) {
   return clean
 }
 
+/**
+ * A job between a Claude worker the bridge started (a herdr worker record) and
+ * a sender whose mod gave its Claude session: its messages go by Claude's
+ * cross-session messages both ways. Codex workers, Codex senders and Claude
+ * panes the bridge did not start keep the typed delivery.
+ */
+function crossSession(job, kind) {
+  return Boolean(job.worker && job.from_session && isClaude(kind))
+}
+
 /** A Claude worker the bridge started: it gets its work as plain messages (its prompt says how to answer). */
 function isClaudeWorker(job, paneId, kind) {
   if (!isClaude(kind)) {
@@ -381,10 +411,14 @@ function isClaudeWorker(job, paneId, kind) {
  * one-line `[herdr-job …]` note with the file, as before.
  */
 async function deliverJob(store, job, paneId, kind) {
-  // A first delivery goes out once, even when two bridge processes pump at once.
+  // A first delivery goes out once, even when two bridge processes pump at once
+  // (one waiting to be sent, or not delivered, is made again with what joined it).
   const fresh = store.getJob(job.job_id)
-  if (!job.delivered_at && fresh && fresh.status !== 'queued') {
+  if (!job.delivered_at && fresh && !['queued', 'pending', 'undeliverable'].includes(fresh.status)) {
     return fresh
+  }
+  if (crossSession(job, kind)) {
+    return queueSend(store, { ...job, to: paneId, to_kind: kind })
   }
   const pending = (job.messages ?? []).filter(one => one.from === 'sender' && !one.delivered)
   const first = !job.delivered_at
@@ -424,6 +458,236 @@ async function deliverJob(store, job, paneId, kind) {
   store.putJob(next)
   writeWorkerOutput(next.worker)
   return next
+}
+
+function undelivered(job) {
+  return (job.messages ?? []).filter(one => one.from === 'sender' && !one.delivered)
+}
+
+/**
+ * A cross-session job's delivery: nothing is typed; the job waits as `pending`
+ * with the text to send (`outbox`) until its sender's mod takes it (sendTake).
+ * The text is the message itself, with no header: the task and any messages
+ * that came with it the first time, the new messages after that. No length
+ * limit and no task file: it never crosses a command line. While one send is
+ * out (`sending`), what joins the job waits for it (sendDone queues it next).
+ */
+function queueSend(store, job) {
+  if (job.status === 'sending') {
+    return job
+  }
+  const pending = undelivered(job)
+  const first = !job.delivered_at
+  if (!first && pending.length === 0) {
+    return job
+  }
+  const text = (first ? [job.body, ...pending.map(one => one.text)] : pending.map(one => one.text)).join('\n\n')
+  const next = { ...job, status: 'pending', outbox: { id: newId('send'), text, seqs: pending.map(one => one.seq), at: now() } }
+  delete next.error
+  store.putJob(next)
+  writeWorkerOutput(next.worker)
+  return next
+}
+
+/** A cross-session job its worker did not get: open, with an event that says why (the sender decides what next). */
+function markUndeliverable(store, job, reason) {
+  const next = withEvent({ ...job, status: 'undeliverable', outbox: null, error: reason }, 'undeliverable', { note: reason })
+  store.putJob(next)
+  writeWorkerOutput(next.worker)
+  return next
+}
+
+/**
+ * The sender's mod takes what waits to be sent for its Claude workers: each of
+ * its pending jobs whose worker has reported its Claude session. Taking
+ * records the delivery (delivered_at now, the messages delivered, status
+ * sending) before the send: the worker may take the message and end its turn
+ * before the mod reports back, and turnEnd counts only a turn that took the
+ * latest delivery. A worker running for SESSION_WAIT_MS without a session
+ * makes its job undeliverable (`failed`), and so does a send taken
+ * SEND_WAIT_MS ago whose result never came back (the mod that took it
+ * stopped): it may or may not have arrived, so its delivery stays recorded
+ * (an answer to it still completes the job) and the sender is told to check
+ * the worker's output before sending again.
+ */
+export function sendTake(ctx) {
+  requireFrom(ctx)
+  const items = []
+  const failed = []
+  for (const { store, job } of allJobs().filter(({ job }) => job.from === ctx.from && (job.status === 'pending' || job.status === 'sending'))) {
+    // Another process (a tick, the SendMessage hook) may have taken it a moment ago.
+    const fresh = store.getJob(job.job_id)
+    if (fresh?.status === 'sending' && fresh.outbox && Date.now() - Date.parse(fresh.outbox.taken_at ?? '') > SEND_WAIT_MS) {
+      const output = fresh.worker ? findWorkerById(fresh.worker)?.worker.output_file : null
+      const reason = `the result of sending it never came back, so the message may or may not have arrived; Read the worker's output file${output ? ` (${output})` : ''} before sending it again`
+      const marked = markUndeliverable(store, fresh, reason)
+      failed.push({ job_id: marked.job_id, reason, event: `${marked.job_id}#${marked.seq}` })
+      continue
+    }
+    if (fresh?.status !== 'pending' || !fresh.outbox) {
+      continue
+    }
+    const worker = fresh.worker ? findWorkerById(fresh.worker)?.worker ?? null : null
+    const sessionId = worker?.session_id
+    if (!sessionId) {
+      const since = Date.parse(worker?.running_at ?? '')
+      if (worker?.status === 'running' && Date.now() - since > SESSION_WAIT_MS) {
+        const reason = `the Claude worker in pane ${worker.pane_id} has run for over ${SESSION_WAIT_MS / 1000} s without reporting its Claude session, so there is no session to send to (is herdr-commander loaded there, with takeover on?)`
+        const marked = markUndeliverable(store, fresh, reason)
+        failed.push({ job_id: marked.job_id, reason, event: `${marked.job_id}#${marked.seq}` })
+      }
+      continue
+    }
+    const seqs = fresh.outbox.seqs ?? []
+    const taken = {
+      ...fresh,
+      status: 'sending',
+      prior_delivered_at: fresh.delivered_at ?? null,
+      delivered_at: now(),
+      delivered_as: 'session',
+      messages: (fresh.messages ?? []).map(one => (seqs.includes(one.seq) ? { ...one, delivered: true } : one)),
+      outbox: { ...fresh.outbox, session_id: sessionId, taken_at: now() },
+    }
+    store.putJob(taken)
+    writeWorkerOutput(taken.worker)
+    items.push({ job_id: taken.job_id, send_id: taken.outbox.id, session_id: sessionId, text: taken.outbox.text, worker: taken.worker })
+  }
+  return { items, failed }
+}
+
+/**
+ * The sender's mod reports a send it took. Delivered: the job is `sent` (and
+ * what joined it meanwhile waits as the next send). Not delivered: the
+ * delivery is withdrawn (delivered_at back, the messages undelivered) and the
+ * job is `undeliverable` with an event naming the reason. Never typed into
+ * the pane instead: the sender decides (send again, TaskStop, ask the person).
+ */
+export function sendDone(ctx, { job_id: jobId, send_id: sendId, delivered, reason } = {}) {
+  requireFrom(ctx)
+  const store = storeOfJob(requireWorkspace(ctx), String(jobId))
+  const job = store.getJob(String(jobId))
+  if (!job || job.from !== ctx.from) {
+    throw new BridgeError('no_job', `no job ${jobId} of ${ctx.from}`)
+  }
+  if (job.status !== 'sending' || job.outbox?.id !== sendId) {
+    // It moved on meanwhile (completed by the worker's answer, stopped).
+    return { job, stale: true }
+  }
+  if (delivered === true) {
+    let next = { ...job, status: 'sent', outbox: null }
+    delete next.prior_delivered_at
+    delete next.error
+    store.putJob(next)
+    next = queueSend(store, next)
+    writeWorkerOutput(next.worker)
+    return { job: next, delivered: true }
+  }
+  const seqs = job.outbox?.seqs ?? []
+  const withdrawn = {
+    ...job,
+    messages: (job.messages ?? []).map(one => (seqs.includes(one.seq) ? { ...one, delivered: false } : one)),
+  }
+  if (job.prior_delivered_at) {
+    withdrawn.delivered_at = job.prior_delivered_at
+  } else {
+    delete withdrawn.delivered_at
+    delete withdrawn.delivered_as
+  }
+  delete withdrawn.prior_delivered_at
+  const next = markUndeliverable(store, withdrawn, String(reason || 'not delivered'))
+  return { job: next, delivered: false, event: `${next.job_id}#${next.seq}` }
+}
+
+/** The event mark of a worker → sender notice its own mod sends by Claude's cross-session messages. */
+function relayMark(job) {
+  return crossSession(job, job.to_kind) ? { relay: 'sending', relay_at: now() } : {}
+}
+
+/** What a worker's mod sends to the sender for an event marked relay: the data (the mod writes the text). */
+function noticeOf(job, seq) {
+  const event = (job.events ?? []).find(one => one.seq === seq)
+  if (!event || event.relay !== 'sending') {
+    return undefined
+  }
+  const worker = job.worker ? findWorkerById(job.worker)?.worker ?? null : null
+  return { session_id: job.from_session, event_seq: seq, job, worker: worker ? { ...worker, job: OPEN_JOB.has(job.status) ? job.job_id : null, queued: 0 } : null }
+}
+
+/** The worker's mod reports a notice it sent (or could not): the sender's mod tells it itself when not. */
+export function relayDone(ctx, { job_id: jobId, event_seq: eventSeq, delivered, reason } = {}) {
+  requireFrom(ctx)
+  const store = storeOfJob(requireWorkspace(ctx), String(jobId))
+  const job = store.getJob(String(jobId))
+  if (!job || job.to !== ctx.from) {
+    throw new BridgeError('no_job', `no job ${jobId} sent to ${ctx.from}`)
+  }
+  const ok = delivered === true
+  const events = (job.events ?? []).map(one => (one.seq === Number(eventSeq) && one.relay === 'sending'
+    ? { ...one, relay: ok ? 'sent' : 'failed', relay_at: now(), ...(ok ? {} : { relay_error: String(reason || 'not delivered') }) }
+    : one))
+  store.putJob({ ...job, events })
+  return { relayed: ok }
+}
+
+/**
+ * A Claude worker tells the bridge its Claude session (at its start, and again
+ * in a new conversation after /clear or /resume): the address its work is
+ * sent to. Recorded on the live herdr worker of this pane.
+ */
+export function workerSession(ctx, { session_id: sessionId } = {}) {
+  requireFrom(ctx)
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    throw new BridgeError('bad_session', 'session_id is required')
+  }
+  const hit = findWorker(one => one.pane_id === ctx.from && liveWorker(one))
+  if (!hit) {
+    return { recorded: false }
+  }
+  hit.store.putWorker({ ...hit.store.getWorker(hit.worker.herdr_id), session_id: sessionId, session_at: now() })
+  return { recorded: true, herdr_id: hit.worker.herdr_id }
+}
+
+/**
+ * A message another session's model sent this Claude worker by Claude's own
+ * cross-session messages, past the bridge (the sender answered a notice's
+ * `from=` address itself). The worker's mod reports it as it arrives, with
+ * the time it did (`received_at`, ms). It is taken as from the worker's
+ * owner, already delivered: added to the owner's open job, else the owner's
+ * latest completed job reopens with it (its result kept, keepResult), else
+ * nothing. The delivery time is the arrival, not now: the turn that takes it
+ * began then, and turnEnd counts a turn only from its delivery on.
+ */
+export function peerMessage(ctx, { text, received_at: receivedAt, from_session: fromSession } = {}) {
+  requireFrom(ctx)
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new BridgeError('bad_body', 'text is required')
+  }
+  const hit = findWorker(one => one.pane_id === ctx.from && liveWorker(one))
+  if (!hit) {
+    return { recorded: false }
+  }
+  const { worker } = hit
+  const mine = jobsFor({ worker, paneId: ctx.from }).filter(({ job }) => job.from === worker.owner)
+  const open = mine.filter(({ job }) => OPEN_JOB.has(job.status)).sort((a, b) => String(b.job.delivered_at ?? '').localeCompare(String(a.job.delivered_at ?? '')))[0]
+  const last = mine.filter(({ job }) => job.status === 'completed').sort((a, b) => String(b.job.completed_at).localeCompare(String(a.job.completed_at)))[0]
+  // A job of the owner still queued behind another sender's: not this worker's to take yet.
+  if (!open && (!last || mine.some(({ job }) => job.status === 'queued'))) {
+    return { recorded: false }
+  }
+  const held = open ?? { store: last.store, job: { ...keepResult(last.store, last.job), status: 'sent', outbox: null } }
+  const at = Number.isFinite(Number(receivedAt)) ? new Date(Number(receivedAt)).toISOString() : now()
+  let job = withMessage(held.job, 'sender', text)
+  job = {
+    ...job,
+    to: ctx.from,
+    messages: job.messages.map(one => (one.seq === job.seq ? { ...one, at, delivered: true } : one)),
+    delivered_at: at,
+    delivered_as: 'peer',
+    ...(typeof fromSession === 'string' && fromSession !== '' ? { from_session: fromSession } : {}),
+  }
+  held.store.putJob(job)
+  writeWorkerOutput(job.worker)
+  return { recorded: true, job_id: job.job_id, how: open ? 'appended' : 'reopened' }
 }
 
 // Recipients ------------------------------------------------------------------
@@ -541,7 +805,7 @@ function keepResult(store, job) {
  * completed job with the worker reopens; else a new job. A worker busy with
  * another sender's job gets it after that job (queued).
  */
-export async function message(ctx, { to, text, kind = 'task' }) {
+export async function message(ctx, { to, text, kind = 'task', from_session: fromSession }) {
   requireFrom(ctx)
   const ws = requireWorkspace(ctx)
   if (typeof text !== 'string' || text.trim() === '') {
@@ -566,11 +830,13 @@ export async function message(ctx, { to, text, kind = 'task' }) {
   if (target.worker && !liveWorker(target.worker)) {
     throw new BridgeError('worker_gone', `${target.worker.herdr_id} is ${target.worker.status}`)
   }
+  // The sender's latest Claude session (it may have switched conversations since).
+  const sender = job => (typeof fromSession === 'string' && fromSession !== '' ? { ...job, from_session: fromSession } : job)
   const list = jobsFor(target)
   const mine = list.filter(({ job }) => job.from === ctx.from)
   const active = mine.find(({ job }) => ACTIVE_JOB.has(job.status))
   if (active) {
-    let job = withMessage(active.job, 'sender', text)
+    let job = sender(withMessage(active.job, 'sender', text))
     active.store.putJob(job)
     if (OPEN_JOB.has(job.status)) {
       job = await deliverJob(active.store, job, target.paneId, target.kind)
@@ -582,14 +848,14 @@ export async function message(ctx, { to, text, kind = 'task' }) {
   let held
   let action
   if (last) {
-    held = { store: last.store, job: withMessage(keepResult(last.store, last.job), 'sender', text) }
+    held = { store: last.store, job: sender(withMessage(keepResult(last.store, last.job), 'sender', text)) }
     action = 'reopened'
   } else {
     const store = storeFor(ws)
     const jobId = newId('job')
     held = {
       store,
-      job: {
+      job: sender({
         job_id: jobId,
         workspace_id: ws,
         from: ctx.from,
@@ -607,7 +873,7 @@ export async function message(ctx, { to, text, kind = 'task' }) {
         seq: 0,
         created_at: now(),
         queued_at: now(),
-      },
+      }),
     }
     action = 'new'
   }
@@ -634,7 +900,8 @@ export async function send(ctx, { target, kind = 'task', body }) {
  * open job (else of its latest job); to a sender's pane id or name goes to
  * that sender. Passed on whole, whatever it says, as a report along the way:
  * it does not complete the job (the final answer of the turn does).
- * `routed: false` when this pane has no such job.
+ * `routed: false` when this pane has no such job. On a cross-session job the
+ * `notice` is for the worker's mod to send (relayDone).
  */
 export async function reply(ctx, { to, text }) {
   requireFrom(ctx)
@@ -662,10 +929,10 @@ export async function reply(ctx, { to, text }) {
   const hit = open.length > 0 ? latest(open, 'delivered_at') : latest(candidates, 'updated_at')
   const isOpen = OPEN_JOB.has(hit.job.status)
   let job = withWorkerText(hit.job, text)
-  job = withEvent(job, 'message', { message_seq: job.seq })
+  job = withEvent(job, 'message', { message_seq: job.seq, ...relayMark(job) })
   hit.store.putJob(job)
   writeWorkerOutput(job.worker)
-  return { routed: true, job_id: job.job_id, to: job.from, open: isOpen }
+  return { routed: true, job_id: job.job_id, to: job.from, open: isOpen, notice: noticeOf(job, job.seq) }
 }
 
 /** A worker's text, already passed on to the sender, as one of the job's messages. */
@@ -688,18 +955,26 @@ function withWorkerText(job, text) {
  * A turn covers the job when the job's latest delivery came in as a prompt of
  * that turn: `prompt_at` (the last prompt the turn took, a message delivered
  * into the running turn included) or else `started_at` is not before it. A
- * turn that began earlier and never took it says nothing about the job.
+ * turn that began earlier and never took it says nothing about the job, nor
+ * does one while a newer delivery still waits to be sent (pending) or none
+ * reached the worker at all.
+ *
+ * On a cross-session job the event is marked relay and returned as `notice`:
+ * the worker's mod sends it to the sender and reports (relayDone).
  */
 export async function turnEnd(ctx, { started_at: startedAt, prompt_at: promptAt, reason, aborted, answer } = {}) {
   requireFrom(ctx)
   const open = allJobs()
     .filter(({ job }) => job.to === ctx.from && OPEN_JOB.has(job.status))
-    .sort((a, b) => String(b.job.delivered_at).localeCompare(String(a.job.delivered_at)))[0]
+    .sort((a, b) => String(b.job.delivered_at ?? '').localeCompare(String(a.job.delivered_at ?? '')))[0]
   if (!open) {
     return { job: null }
   }
   const { store } = open
   let job = open.job
+  if (job.status === 'pending' || !job.delivered_at) {
+    return { job }
+  }
   const at = typeof promptAt === 'number' ? promptAt : typeof startedAt === 'number' ? startedAt : null
   const coversJob = at === null || new Date(at).toISOString() >= job.delivered_at
   if (!coversJob) {
@@ -708,19 +983,20 @@ export async function turnEnd(ctx, { started_at: startedAt, prompt_at: promptAt,
   const text = typeof answer === 'string' ? answer : ''
   if (reason === 'answer' && aborted !== true && text.trim() !== '') {
     job = withWorkerText(job, text)
-    job = await finishJob(store, { ...job, completed_via: 'answer', answer_seq: job.seq })
-    return { job, completed: true }
+    job = await finishJob(store, { ...job, completed_via: 'answer', answer_seq: job.seq }, relayMark(job))
+    const event = job.events.findLast(one => one.type === 'completed')
+    return { job, completed: true, notice: event ? noticeOf(job, event.seq) : undefined }
   }
   if (!(job.reminded_at && job.reminded_at >= job.delivered_at)) {
-    job = withEvent({ ...job, reminded_at: now() }, 'stopped_without_answer', { reason: typeof reason === 'string' ? reason : 'unknown' })
+    job = withEvent({ ...job, reminded_at: now() }, 'stopped_without_answer', { reason: typeof reason === 'string' ? reason : 'unknown', ...relayMark(job) })
     store.putJob(job)
-    return { job, reminded: true }
+    return { job, reminded: true, notice: noticeOf(job, job.seq) }
   }
   return { job }
 }
 
-/** Marks a job completed (any route) and runs what follows once. */
-async function finishJob(store, job) {
+/** Marks a job completed (any route) and runs what follows once; `mark` joins its completed event. */
+async function finishJob(store, job, mark = {}) {
   // Another bridge process may have finished it a moment ago: finish once.
   const fresh = store.getJob(job.job_id)
   if (fresh && !OPEN_JOB.has(fresh.status)) {
@@ -733,7 +1009,7 @@ async function finishJob(store, job) {
     done.summary = String(last?.text ?? '').split(/\r?\n/).find(line => line.trim() !== '')?.trim().slice(0, 200) ?? ''
     writeFileSync(job.result_path, `job_id: ${job.job_id}\n\n${sent.map(one => one.text).join('\n\n---\n\n')}\n`, 'utf8')
   }
-  const marked = withEvent(done, 'completed', { via: job.completed_via, ...(job.answer_seq ? { message_seq: job.answer_seq } : {}) })
+  const marked = withEvent(done, 'completed', { via: job.completed_via, ...(job.answer_seq ? { message_seq: job.answer_seq } : {}), ...mark })
   delete marked.answer_seq
   store.putJob(marked)
   const out = await onCompleted(store, marked)
@@ -905,11 +1181,19 @@ export function newHerdrId(kind, workspace) {
 /**
  * The command that starts a Claude worker with this same plugin: the installed
  * copy loads by itself; a working copy goes by --plugin-dir, which also takes
- * precedence over an installed copy of the same name.
+ * precedence over an installed copy of the same name. `permissionMode`: the
+ * sender's mode, so the two sessions' cross-session messages are not held for
+ * the person's approval (they are when the modes differ).
  */
-export function claudeLine(root = TOOL_ROOT, { model } = {}) {
-  const base = isInstalledCopy(root) ? 'claude' : `claude --plugin-dir '${root}'`
-  return model && /^[A-Za-z0-9._-]+$/.test(model) ? `${base} --model ${model}` : base
+export function claudeLine(root = TOOL_ROOT, { model, permissionMode } = {}) {
+  const parts = [isInstalledCopy(root) ? 'claude' : `claude --plugin-dir '${root}'`]
+  if (model && /^[A-Za-z0-9._-]+$/.test(model)) {
+    parts.push(`--model ${model}`)
+  }
+  if (PERMISSION_MODES.has(permissionMode)) {
+    parts.push(`--permission-mode ${permissionMode}`)
+  }
+  return parts.join(' ')
 }
 
 /** Workers never start panes; a plain pane may while no other live pane holds the commander lease. */
@@ -929,7 +1213,7 @@ async function requireMayStart(ctx) {
 }
 
 /** Splits a pane beside the caller and starts the agent there; waits until herdr sees it settle. */
-async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, model }) {
+async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, model, permissionMode, herdrId }) {
   const split = await runJson([
     'pane', 'split', '--pane', ctx.from,
     '--direction', direction === 'down' ? 'down' : 'right',
@@ -945,10 +1229,15 @@ async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, m
   const store = storeFor(ws)
   const agentName = workerName(name, kind)
   store.addOwned({ pane_id: paneId, owner: ctx.from, kind, name: agentName, created_at: now() })
+  if (herdrId) {
+    // Before the agent starts: a Claude worker reports its session by its pane
+    // as soon as it is up, while this call still waits for it to settle.
+    store.putWorker({ ...store.getWorker(herdrId), pane_id: paneId, agent_name: agentName })
+  }
   // The pane shell is PowerShell 5.1, which mangles embedded quotes in native
   // arguments; so the command line typed there carries no quoted payload.
   const line = kind === 'claude'
-    ? claudeLine(TOOL_ROOT, { model })
+    ? claudeLine(TOOL_ROOT, { model, permissionMode })
     : `& '${process.execPath}' '${CLI_PATH}' codex-launch b64:${Buffer.from(JSON.stringify({ role: 'worker', pane: paneId, workspace: ws })).toString('base64')}`
   await runJson(['pane', 'run', paneId, line])
   const detected = await waitForAgent(paneId, kind, Number(process.env.HERDR_BRIDGE_START_MS ?? 90000))
@@ -998,8 +1287,11 @@ function samePath(a, b) {
  * the output file. The pane is opened by worker-start, which the caller runs
  * in the background (it can take up to ~90 s while the agent starts).
  * `forbid_cwd`: refuse that folder (herdr_worker_spawn is for other folders).
+ * `from_session`: the caller's Claude session (its mod's), so a Claude worker's
+ * messages go by Claude's cross-session messages; `permission_mode`: the
+ * caller's mode, which a Claude worker starts in.
  */
-export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, subagent_type: subagentType, description, forbid_cwd: forbidCwd }) {
+export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, subagent_type: subagentType, description, forbid_cwd: forbidCwd, from_session: fromSession, permission_mode: permissionMode }) {
   const ws = await requireMayStart(ctx)
   if (!['claude', 'codex'].includes(kind)) {
     throw new BridgeError('bad_kind', 'kind must be claude or codex')
@@ -1031,13 +1323,14 @@ export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, 
     subagent_type: subagentType ?? null,
     description: description ?? null,
     model: model ?? null,
+    permission_mode: PERMISSION_MODES.has(permissionMode) ? permissionMode : null,
     cwd: dir,
     output_file: store.outputPath(herdrId),
     status: 'starting',
     created_at: now(),
   }
   store.putWorker(worker)
-  const { job } = await message(ctx, { to: herdrId, text: task, kind: 'task' })
+  const { job } = await message(ctx, { to: herdrId, text: task, kind: 'task', from_session: fromSession })
   writeWorkerOutput(herdrId)
   return { worker: store.getWorker(herdrId), job }
 }
@@ -1067,7 +1360,7 @@ export async function workerStart(ctx, { herdr_id: herdrId }) {
   }
   let opened
   try {
-    opened = await openWorkerPane(ctx, ws, { kind: worker.worker_kind, cwd: worker.cwd, name: worker.name ?? worker.description ?? undefined, model: worker.model ?? undefined })
+    opened = await openWorkerPane(ctx, ws, { kind: worker.worker_kind, cwd: worker.cwd, name: worker.name ?? worker.description ?? undefined, model: worker.model ?? undefined, permissionMode: worker.permission_mode ?? undefined, herdrId: worker.herdr_id })
   } catch (error) {
     return failWith('failed', 'start_failed', `${error.code ?? 'error'}: ${error.message ?? error}`)
   }
@@ -1079,7 +1372,7 @@ export async function workerStart(ctx, { herdr_id: herdrId }) {
   if (detected.agent_status === 'blocked') {
     return failWith('blocked', 'start_blocked', `${paneId} is waiting on a prompt (folder trust, login, ...); the person must answer it in that pane. The task goes out once the worker is idle.`)
   }
-  const running = { ...store.getWorker(worker.herdr_id), status: 'running' }
+  const running = { ...store.getWorker(worker.herdr_id), status: 'running', running_at: now() }
   store.putWorker(running)
   await pump({ worker: running, paneId, kind: running.worker_kind })
   writeWorkerOutput(running.herdr_id)
@@ -1137,7 +1430,7 @@ export async function stop(ctx, { target }) {
  * a job of that recipient, else a message to a herdr worker, agent or pane,
  * else `none` (the mod hands it to Claude's own SendMessage).
  */
-export async function route(ctx, { to, text }) {
+export async function route(ctx, { to, text, from_session: fromSession }) {
   const replied = await reply(ctx, { to, text })
   if (replied.routed) {
     return { action: 'reply', ...replied }
@@ -1145,7 +1438,7 @@ export async function route(ctx, { to, text }) {
   if (to === 'main' || !(await resolveRecipient(ctx, to).catch(() => null))) {
     return { action: 'none' }
   }
-  const sent = await message(ctx, { to, text, kind: 'task' })
+  const sent = await message(ctx, { to, text, kind: 'task', from_session: fromSession })
   return { ...sent, action: 'message', how: sent.action }
 }
 
@@ -1348,7 +1641,7 @@ export async function snapshot(ctx) {
   for (const worker of workers.filter(one => one.status === 'blocked' && one.pane_id)) {
     const pane = agents.find(one => one.pane_id === worker.pane_id)
     if (pane && (pane.status === 'idle' || pane.status === 'done')) {
-      const running = { ...worker, status: 'running', note: undefined }
+      const running = { ...worker, status: 'running', running_at: now(), note: undefined }
       store.putWorker(running)
       await pump({ worker: running, paneId: running.pane_id, kind: running.worker_kind }).catch(() => null)
     }

@@ -685,3 +685,238 @@ test('what can be typed straight into a pane', () => {
   assert.equal(ops.directText('# note'), null)
   assert.equal(ops.directText('   '), null)
 })
+
+// Claude worker ↔ Claude sender by Claude's cross-session messages (0.3.0) -----
+
+const nine = { from: 'wA:p9', workspace: 'wA', role: 'worker', byUser: false }
+const NINE = { pane_id: 'wA:p9', agent: 'claude', agent_status: 'idle', workspace_id: 'wA' }
+
+/** A Claude worker in wA:p9 started by me (a Claude sender, session-boss); `session`: what its mod reports. */
+async function crossWorker({ task = 'build it', session = 'session-w', permission } = {}) {
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  const out = await ops.workerNew(me, { kind: 'claude', cwd: dir, task, from_session: 'session-boss', permission_mode: permission })
+  arrange({ agents: [...AGENTS, NINE], nextPane: 'wA:p9', spawnAgent: 'claude' })
+  await ops.workerStart(me, { herdr_id: out.worker.herdr_id })
+  if (session) {
+    assert.equal(ops.workerSession(nine, { session_id: session }).recorded, true)
+  }
+  return { herdrId: out.worker.herdr_id, jobId: out.job.job_id }
+}
+
+test('a Claude sender\'s job for a Claude worker is not typed: it waits to be sent, the task itself with no header or length limit', async () => {
+  const task = `/review this\n${'長'.repeat(ops.DIRECT_LIMIT)}`
+  const { jobId } = await crossWorker({ task })
+  const job = new Store('wA').getJob(jobId)
+  assert.equal(job.status, 'pending')
+  assert.equal(job.from_session, 'session-boss')
+  assert.equal(job.outbox.text, task)
+  assert.equal(prompts('wA:p9').length, 0)
+  assert.equal(existsSync(job.task_path), false, 'no task file')
+})
+
+test('taking a send records the delivery before it is sent, so an answer that comes first still completes the job; it is taken once', async () => {
+  const { jobId } = await crossWorker()
+  const taken = ops.sendTake(me)
+  assert.deepEqual(taken.items.map(one => [one.job_id, one.session_id, one.text]), [[jobId, 'session-w', 'build it']])
+  assert.deepEqual(ops.sendTake(me).items, [], 'taken once')
+  const sending = new Store('wA').getJob(jobId)
+  assert.equal(sending.status, 'sending')
+  assert.ok(sending.delivered_at)
+  // The worker took it and answered before the sender's mod reported the send.
+  const done = await ops.turnEnd(nine, answered('built', { prompt_at: Date.now() }))
+  assert.equal(done.job.status, 'completed')
+  assert.equal(ops.sendDone(me, { job_id: jobId, send_id: taken.items[0].send_id, delivered: true }).stale, true)
+  assert.equal(new Store('wA').getJob(jobId).status, 'completed')
+  assert.equal(calls().some(args => args[0] === 'agent' && args[1] === 'prompt'), false, 'nothing typed')
+})
+
+test('a send that fails is withdrawn: undeliverable with the reason, never typed; SendMessage again resends the same job', async () => {
+  const { herdrId, jobId } = await crossWorker()
+  const taken = ops.sendTake(me).items[0]
+  const failed = ops.sendDone(me, { job_id: jobId, send_id: taken.send_id, delivered: false, reason: 'that session is not running' })
+  assert.equal(failed.delivered, false)
+  const job = new Store('wA').getJob(jobId)
+  assert.equal(job.status, 'undeliverable')
+  assert.equal(job.delivered_at, undefined, 'the delivery is withdrawn')
+  assert.deepEqual([job.events.at(-1).type, job.events.at(-1).note], ['undeliverable', 'that session is not running'])
+  assert.equal(failed.event, `${jobId}#${job.events.at(-1).seq}`)
+  assert.equal(prompts('wA:p9').length, 0, 'never typed instead')
+  // A turn of the worker says nothing about a job it never got.
+  assert.equal((await ops.turnEnd(nine, answered('something else'))).job.status, 'undeliverable')
+  const again = await ops.message(me, { to: herdrId, text: 'try again', from_session: 'session-boss-2' })
+  assert.deepEqual([again.action, again.job.job_id, again.job.status], ['appended', jobId, 'pending'])
+  assert.equal(again.job.outbox.text, 'build it\n\ntry again')
+  assert.equal(again.job.from_session, 'session-boss-2', 'the sender\'s latest session')
+  const resent = ops.sendTake(me).items[0]
+  ops.sendDone(me, { job_id: jobId, send_id: resent.send_id, delivered: true })
+  assert.equal(new Store('wA').getJob(jobId).status, 'sent')
+})
+
+test('a follow-up that fails goes back to the earlier delivery; one that joins while a send is out goes next', async () => {
+  const { herdrId, jobId } = await crossWorker()
+  const first = ops.sendTake(me).items[0]
+  await ops.message(me, { to: herdrId, text: 'and test it', from_session: 'session-boss' })
+  assert.equal(new Store('wA').getJob(jobId).status, 'sending', 'waits for the send that is out')
+  const after = ops.sendDone(me, { job_id: jobId, send_id: first.send_id, delivered: true })
+  assert.deepEqual([after.job.status, after.job.outbox.text], ['pending', 'and test it'])
+  const deliveredAt = new Store('wA').getJob(jobId).delivered_at
+  const second = ops.sendTake(me).items[0]
+  ops.sendDone(me, { job_id: jobId, send_id: second.send_id, delivered: false, reason: 'held' })
+  const job = new Store('wA').getJob(jobId)
+  assert.equal(job.delivered_at, deliveredAt)
+  assert.equal(job.messages.find(one => one.text === 'and test it').delivered, false)
+  // The worker's turn on the task it did get still completes the job.
+  assert.equal((await ops.turnEnd(nine, answered('built', { prompt_at: Date.now() }))).job.status, 'completed')
+})
+
+test('a queued job of another Claude sender waits to be sent when the worker\'s first job completes', async () => {
+  const { herdrId, jobId } = await crossWorker()
+  const theirs = await ops.message(other, { to: herdrId, text: 'theirs', from_session: 'session-other' })
+  assert.equal(theirs.job.status, 'queued')
+  const taken = ops.sendTake(me).items[0]
+  ops.sendDone(me, { job_id: jobId, send_id: taken.send_id, delivered: true })
+  await ops.turnEnd(nine, answered('built', { prompt_at: Date.now() }))
+  const next = new Store('wA').getJob(theirs.job.job_id)
+  assert.deepEqual([next.status, next.outbox.text], ['pending', 'theirs'])
+  assert.deepEqual(ops.sendTake(me).items, [], 'only its own sender takes it')
+  assert.deepEqual(ops.sendTake(other).items.map(one => one.session_id), ['session-w'])
+  assert.equal(prompts('wA:p9').length, 0)
+})
+
+test('a Claude worker running 60 s without reporting its session: the job is undeliverable', async () => {
+  const { herdrId, jobId } = await crossWorker({ session: null })
+  assert.deepEqual(ops.sendTake(me), { items: [], failed: [] })
+  assert.equal(new Store('wA').getJob(jobId).status, 'pending', 'still waiting')
+  const store = new Store('wA')
+  store.putWorker({ ...store.getWorker(herdrId), running_at: new Date(Date.now() - 61000).toISOString() })
+  const out = ops.sendTake(me)
+  assert.equal(out.items.length, 0)
+  assert.match(out.failed[0].reason, /over 60 s without reporting its Claude session/)
+  const job = store.getJob(jobId)
+  assert.deepEqual([job.status, job.events.at(-1).type], ['undeliverable', 'undeliverable'])
+  assert.equal(prompts('wA:p9').length, 0)
+})
+
+test('Codex workers, Codex senders and Claude panes the bridge did not start keep the typed delivery', async () => {
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  const codex = await ops.workerNew(me, { kind: 'codex', cwd: dir, task: 'review it', from_session: 'session-boss' })
+  arrange({ agents: [...AGENTS, { ...NINE, agent: 'codex' }], nextPane: 'wA:p9', spawnAgent: 'codex' })
+  await ops.workerStart(me, { herdr_id: codex.worker.herdr_id })
+  assert.equal(new Store('wA').getJob(codex.job.job_id).status, 'sent')
+  assert.match(prompts('wA:p9')[0][3], /^\[herdr-job /)
+  // A Claude worker whose sender gave no session (a Codex commander's): typed as before.
+  writeFileSync(logPath, '')
+  const claude = await ops.workerNew(me, { kind: 'claude', cwd: dir, task: 'x' })
+  arrange({ agents: [...AGENTS, NINE, { ...NINE, pane_id: 'wA:pB' }], nextPane: 'wA:pB', spawnAgent: 'claude' })
+  await ops.workerStart(me, { herdr_id: claude.worker.herdr_id })
+  assert.deepEqual([new Store('wA').getJob(claude.job.job_id).status, prompts('wA:pB')[0][3]], ['sent', 'x'])
+  // A Claude pane the bridge did not start, from a Claude sender: typed as before.
+  claudeWorker()
+  const plain = await ops.message(me, { to: 'wA:p2', text: 'do it', from_session: 'session-boss' })
+  assert.equal(plain.job.status, 'sent')
+  assert.equal((await ops.turnEnd(worker, answered('done'))).notice, undefined, 'and its answer is not relayed')
+})
+
+test('the worker\'s result and its reports along the way come back as notices for its mod to send, marked so the sender does not repeat them', async () => {
+  const { jobId } = await crossWorker()
+  const taken = ops.sendTake(me).items[0]
+  ops.sendDone(me, { job_id: jobId, send_id: taken.send_id, delivered: true })
+  const routed = await ops.route(nine, { to: 'main', text: 'Halfway', from_session: 'session-w' })
+  assert.equal(routed.action, 'reply')
+  assert.equal(routed.notice.session_id, 'session-boss')
+  const message = routed.notice.job.events.find(one => one.seq === routed.notice.event_seq)
+  assert.deepEqual([message.type, message.relay], ['message', 'sending'])
+  assert.equal(routed.notice.worker.herdr_id, routed.notice.job.worker)
+  assert.deepEqual(ops.relayDone(nine, { job_id: jobId, event_seq: routed.notice.event_seq, delivered: false, reason: 'held for approval' }), { relayed: false })
+  const marked = new Store('wA').getJob(jobId).events.find(one => one.seq === routed.notice.event_seq)
+  assert.deepEqual([marked.relay, marked.relay_error], ['failed', 'held for approval'])
+  const done = await ops.turnEnd(nine, answered('All built.', { prompt_at: Date.now() }))
+  assert.equal(done.completed, true)
+  const completed = done.notice.job.events.find(one => one.seq === done.notice.event_seq)
+  assert.deepEqual([completed.type, completed.via, completed.relay], ['completed', 'answer', 'sending'])
+  assert.equal(done.notice.job.messages.find(one => one.seq === completed.message_seq).text, 'All built.')
+  ops.relayDone(nine, { job_id: jobId, event_seq: done.notice.event_seq, delivered: true })
+  assert.equal(new Store('wA').getJob(jobId).events.find(one => one.seq === done.notice.event_seq).relay, 'sent')
+  assert.throws(() => ops.relayDone(other, { job_id: jobId, event_seq: 1, delivered: true }), /no job/)
+})
+
+test('a worker\'s session is recorded on its live worker by pane, which the worker gets before its agent starts', async () => {
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  const out = await ops.workerNew(me, { kind: 'claude', cwd: dir, task: 'x', from_session: 'session-boss' })
+  assert.deepEqual(ops.workerSession(nine, { session_id: 's' }), { recorded: false }, 'no pane yet')
+  // Starting the agent fails; the pane id was on the record before that.
+  arrange({ agents: AGENTS, nextPane: 'wA:p9', spawnAgent: null, failOn: 'pane run' })
+  await ops.workerStart(me, { herdr_id: out.worker.herdr_id })
+  assert.equal(new Store('wA').getWorker(out.worker.herdr_id).pane_id, 'wA:p9')
+  assert.throws(() => ops.workerSession(nine, {}), /session_id is required/)
+})
+
+test('a send taken 60 s ago whose result never came back: undeliverable, its delivery kept, the sender told to check the output first', async () => {
+  const { jobId } = await crossWorker()
+  const taken = ops.sendTake(me).items[0]
+  const store = new Store('wA')
+  assert.deepEqual(ops.sendTake(me), { items: [], failed: [] }, 'not yet')
+  const stuck = store.getJob(jobId)
+  store.putJob({ ...stuck, outbox: { ...stuck.outbox, taken_at: new Date(Date.now() - 61000).toISOString() } })
+  const out = ops.sendTake(me)
+  assert.equal(out.items.length, 0)
+  assert.match(out.failed[0].reason, /never came back, so the message may or may not have arrived; Read the worker's output file \(.*\.md\) before sending it again/)
+  const job = store.getJob(jobId)
+  assert.deepEqual([job.status, job.events.at(-1).type, job.delivered_at], ['undeliverable', 'undeliverable', stuck.delivered_at])
+  assert.equal(out.failed[0].event, `${jobId}#${job.seq}`)
+  // The late result changes nothing; an answer to the message still completes the job.
+  assert.equal(ops.sendDone(me, { job_id: jobId, send_id: taken.send_id, delivered: true }).stale, true)
+  assert.equal((await ops.turnEnd(nine, answered('built', { prompt_at: Date.now() }))).job.status, 'completed')
+})
+
+test('a message the sender\'s model sent the worker past the bridge joins the open job, delivered when it arrived', async () => {
+  const { jobId } = await crossWorker()
+  const taken = ops.sendTake(me).items[0]
+  ops.sendDone(me, { job_id: jobId, send_id: taken.send_id, delivered: true })
+  const arrived = Date.now() + 5000
+  const out = ops.peerMessage(nine, { text: 'also update the README', received_at: arrived })
+  assert.deepEqual([out.recorded, out.job_id, out.how], [true, jobId, 'appended'])
+  const job = new Store('wA').getJob(jobId)
+  assert.equal(job.delivered_at, new Date(arrived).toISOString(), 'the arrival time, not the bridge\'s now')
+  assert.deepEqual(job.messages.at(-1), { ...job.messages.at(-1), from: 'sender', text: 'also update the README', delivered: true })
+  assert.equal(job.from_session, 'session-boss', 'kept')
+  // A turn that took it (its prompt at the arrival) completes the job; one before it does not.
+  assert.equal((await ops.turnEnd(nine, answered('early', { prompt_at: arrived - 1000 }))).completed, undefined)
+  const done = await ops.turnEnd(nine, answered('README updated', { prompt_at: arrived }))
+  assert.equal(done.job.status, 'completed')
+  assert.equal(done.notice.session_id, 'session-boss')
+  assert.equal(prompts('wA:p9').length, 0)
+})
+
+test('a message past the bridge after the job completed reopens it; with no job of the owner, nothing', async () => {
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  const bare = await ops.workerNew(me, { kind: 'claude', cwd: dir, task: 'x', from_session: 'session-boss' })
+  assert.deepEqual(ops.peerMessage(nine, { text: 'hi', received_at: Date.now() }), { recorded: false }, 'no pane yet')
+  await ops.stop(me, { target: bare.worker.herdr_id })
+  const { jobId } = await crossWorker()
+  const taken = ops.sendTake(me).items[0]
+  ops.sendDone(me, { job_id: jobId, send_id: taken.send_id, delivered: true })
+  await ops.turnEnd(nine, answered('first answer', { prompt_at: Date.now() }))
+  assert.equal(new Store('wA').getJob(jobId).status, 'completed')
+  const arrived = Date.now()
+  const out = ops.peerMessage(nine, { text: '收到回覆三', received_at: arrived, from_session: 'session-boss-2' })
+  assert.deepEqual([out.recorded, out.job_id, out.how], [true, jobId, 'reopened'])
+  const job = new Store('wA').getJob(jobId)
+  assert.deepEqual([job.status, job.delivered_at, job.from_session], ['sent', new Date(arrived).toISOString(), 'session-boss-2'])
+  assert.match(readFileSync(join(new Store('wA').resultsDir, `${jobId}.round1.md`), 'utf8'), /first answer/)
+  const again = await ops.turnEnd(nine, answered('收到回覆三，已處理', { prompt_at: arrived }))
+  assert.equal(again.job.status, 'completed')
+  assert.equal(again.notice.session_id, 'session-boss-2')
+  assert.equal(again.job.messages.some(one => one.text === '收到回覆三'), true)
+  assert.equal(prompts('wA:p9').length, 0)
+  assert.throws(() => ops.peerMessage(nine, { text: ' ' }), /text is required/)
+  assert.deepEqual(ops.peerMessage(other, { text: 'not a worker', received_at: Date.now() }), { recorded: false })
+})
+
+test('a Claude worker starts in its sender\'s permission mode; an unknown mode is left out', async () => {
+  await crossWorker({ permission: 'acceptEdits' })
+  const run = calls().find(args => args[0] === 'pane' && args[1] === 'run')
+  assert.match(run[3], / --permission-mode acceptEdits$/)
+  assert.equal(ops.claudeLine('C:\\Users\\me\\.claude\\plugins\\cache\\h\\h\\0.3.0', { model: 'sonnet', permissionMode: 'plan' }), 'claude --model sonnet --permission-mode plan')
+  assert.equal(ops.claudeLine('C:\\Users\\me\\.claude\\plugins\\cache\\h\\h\\0.3.0', { permissionMode: 'yolo; rm' }), 'claude')
+})

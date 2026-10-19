@@ -17,6 +17,9 @@ export type World = {
   /** Replies per bridge command; a function gets the call. */
   replies: Record<string, unknown | ((call: BridgeCall) => unknown)>
   failures: Record<string, { code: string; message: string }>
+  /** Claude's cross-session messages the mod sent ($.session.send), and how the engine answers them. */
+  sent: Array<{ to: unknown; text: string; origin: unknown }>
+  sendResult: { isDelivered: true } | { isDelivered: false; reason: string }
 }
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -63,6 +66,8 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
       read: { pane_id: 'wA:p2', text: 'line one\nAllow git apply? (y/n)' },
     },
     failures: {},
+    sent: [],
+    sendResult: { isDelivered: true },
   }
 
   on('session.start', () => ({ cwd: 'D:\work' }))
@@ -90,6 +95,11 @@ export function worldOf(on: On, env: Readonly<Record<string, string>> = {}): Wor
     return {
       value: { exitCode: failure ? 1 : 0, stdout: `${JSON.stringify(body)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     } as never
+  })
+
+  on('session.send', ($, e) => {
+    world.sent.push({ to: e.to, text: e.text, origin: e.origin })
+    return world.sendResult
   })
 
   on('tool.register', ($, e) => {

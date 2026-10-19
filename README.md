@@ -19,7 +19,7 @@ claude plugin install herdr-commander@herdr-commander
 
 裝好後所有 Claude session 都會載入它，但**不在 herdr 裡時完全不生效**（每個 hook 都先檢查 `HERDR_ENV`／`HERDR_PANE_ID`）。
 
-更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.2.3`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
+更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.3.0`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
 
 ```powershell
 claude plugin update herdr-commander@herdr-commander
@@ -50,33 +50,52 @@ claude plugin update herdr-commander@herdr-commander
 
 面板按鍵（面板取得焦點時）：`f` 聚焦、`x` 中斷（再按 `y` 送 Esc／`c` 送 Ctrl+C／`n` 取消）、`r` 重新整理；下方輸入框可直接送 prompt 給選中的 agent。
 
-### 在 herdr 裡，Claude 的原生工具走 herdr（0.2.0 起，總開關 `takeover`，預設開；本節是 0.2.2 的行為）
+### 在 herdr 裡，Claude 的原生工具走 herdr（0.2.0 起，總開關 `takeover`，預設開；本節是 0.3.0 的行為）
 
 模型照常用 Claude 原生工具，由 mod 在背後接管；自訂的 herdr 工具只剩一個 `herdr_worker_spawn`。
 
 | 原生工具 | 在 herdr 裡變成 |
 |---|---|
 | Agent，`subagent_type` 是 `herdr-commander:claude-worker` 或 `herdr-commander:codex-worker` | 在 commander 所在的資料夾旁開一個 herdr pane，裡面跑 Claude 或 Codex worker。立刻回「已在背景啟動」，id 是 `herdr-agent-<workspace>-<6 碼>`，outputFile 是 bridge 維護的 Markdown 紀錄（任務、雙方訊息、每次 Read 時的最新畫面）。**其他類型（Explore、general-purpose 等）、fork、remote 一律照原生，不開 pane（使用者已定）** |
-| SendMessage | worker 傳給 `main`（或派工者的 pane id／名字）：原樣立刻轉給派工者，當作中途報告（不算交件）。派工者傳給 worker（herdr id、名字、pane id）：併進進行中的 job；上一個 job 已完成就重新打開同一個 job；worker 正忙別人的 job 就排隊。不看訊息內容 |
+| SendMessage | worker 傳給 `main`（或派工者的 pane id／名字）：原樣立刻轉給派工者，當作中途報告（不算交件）；派工者是 Claude 時用跨 session 訊息寄過去。派工者傳給 worker（herdr id、名字、pane id）：併進進行中的 job；上一個 job 已完成就重新打開同一個 job；worker 正忙別人的 job 就排隊。目標是 bridge 開的 Claude worker 時當場用跨 session 訊息寄出，工具結果會說「已送達」「等 worker 起來再寄」或「送不到：原因」。不看訊息內容 |
 | TaskStop（herdr id，或自己開的 worker 的名字／pane id） | 送 Ctrl+C、關掉 pane，**不問人**；別人開的 pane 一律拒絕 |
 | ListAgents | 原生清單後面接著列：自己開的 herdr worker（id、名字、狀態、目前的 job、排隊數、資料夾、輸出檔），以及其他 herdr pane 的畫面檔路徑 |
 | Read 執行期資料夾裡的檔案 | 先由 bridge 刷新（worker 輸出檔補上最新畫面；`panes\<pane>.txt` 寫入該 pane 畫面），再交給原生 Read；這個資料夾的 Read 不跳權限詢問 |
 | 背景 Bash／PowerShell（`run_in_background`）、Monitor | **不接管，一律是 Claude 原生**（在 herdr 裡也一樣，使用者已定） |
 | `herdr_worker_spawn`（唯一保留的工具，commander／plain） | 在**別的**資料夾開 worker（`cwd`、`kind`、`task` 必填，`name` 選填）；給這個 session 自己的資料夾會被拒，請改用 Agent |
 
-Claude worker 怎麼收到工作：派工者的任務和之後用 SendMessage 送來的訊息，**直接以內容本身**送進 worker（跟原生收到訊息一樣，多行也完整保留），不加任何開頭、也不叫它去讀檔。只有內容送不了時才改成「寫進任務檔＋一行提示」：超過 30,000 字（herdr 用命令列參數送字，Windows 整條命令列上限 32,767 個 UTF-16 字元；實測 31,081 字完整送達、33,000 字 herdr 起不來）、含終端機會當成控制碼的字元、或第一個字是 `/`、`!`、`#`（Claude Code 會當成指令、shell 或記憶）。Codex worker 和不是 bridge 開的 Claude pane 照舊收一行 `[herdr-job …]` 提示加任務檔。送出後幾秒內 pane 沒進入 working，就補一次 Enter（剛啟動的 Claude／Codex 偶爾會留下文字、吃掉 Enter）。
+Claude worker 怎麼收到工作（0.3.0 起）：bridge 開的 Claude worker、由 Claude 派工者（有這個 mod 的 Claude session）派工時，任務和之後用 SendMessage 送來的訊息都走 **Claude Code 內建的跨 session 訊息**，不再打字進輸入框：
+- worker 的 mod 啟動時（以及 `/clear`、`/resume` 換對話後）把自己的 session id 交給 bridge，記在它的 worker 紀錄上；派工者的 mod 在 Agent、`herdr_worker_spawn`、SendMessage 時帶上自己的 session id，記在 job 上（每次都更新，派工者換過對話也找得到）。
+- bridge 不打字，只把 job 標成「待寄」（`pending`），保存要寄的內容：訊息本身，不加任何標頭；第一份是任務加上還沒送的訊息。沒有長度限制，也不走任務檔（不經命令列）。
+- 派工者的 mod 寄出：SendMessage 被接管時當場寄，Agent 開好 worker 時寄一次，輪詢時有待寄的也寄。取走的同時 bridge 先記送達時間、狀態改成「寄送中」（`sending`），寄完再回報。先記時間的原因：worker 可能在 mod 回報之前就收到、做完、結束這一輪，而完成判斷要看「這一輪有沒有收到最新的送達」。
+- worker 收到的是一則跨 session 訊息：閒置時會開新的一輪，忙碌時在它下一次工具結果後面送進去；模型知道這不是使用者打的。
+- **送不到時絕對不改回打字**（使用者決定）：撤回這次送達（訊息回到未送）、job 標成「送不到」（`undeliverable`）並記一筆事件帶原因，SendMessage 的工具結果直接說「送不到：原因」，由派工者決定重送、TaskStop 或問人。之後再 SendMessage 給同一個 worker，會接續同一個 job 重送。worker 開始跑之後超過 60 秒都沒回報 session id，也算送不到。
+- 權限模式：目前**讀不到派工者即時的權限模式**，worker 用使用者設定的預設模式啟動。派工者如果用 shift+tab 或 `--permission-mode` 改過模式，雙方模式不同，跨 session 訊息可能會被擋下等人同意。（原本打算從 classic hook 輸入的 `permission_mode` 取，但實機 debug log 顯示 `classic.SessionStart`、`classic.UserPromptSubmit` 都被內建安全 plugin 略過，永遠不會跑，所以拿掉了。帶 `permission_mode` 給 bridge、bridge 加 `--permission-mode` 的程式還在，只是現在沒有來源給它值。）
+- 派工者的模型照通知裡的 `from=` 地址直接回 worker（不經 SendMessage 的接管，bridge 本來看不到）：worker 的 mod 在 `session.receive` 收到別的 session 的模型寫的訊息時（不是這個 plugin 自己寄的），把原文和收到的時間交給 bridge，一律當作這個 worker 的派工者傳來的：有進行中的 job 就附加進去；沒有就重新打開派工者最近一個已完成的 job；都沒有就不記。送達時間用 worker 收到的時間，所以這一輪結束時照常算完成、照常把結果寄回派工者。
+- 寄送中卡住：派工者的 mod 取走之後超過 60 秒都沒回報寄送結果（例如程序中途停了），下次取件時標成送不到，原因是「寄送結果一直沒有回來，訊息可能到了、也可能沒到，重送前先 Read worker 的輸出檔」。這種情況不撤回送達，worker 如果其實收到並回覆了，job 照常完成。
 
-worker 怎麼知道怎麼交件：mod 把說明附在每則送進 worker 的訊息上（「做完或需要決定時，把結果寫在回覆裡、結束這一輪；最後一則回覆會交給派工者；中途想報告可以 SendMessage 給 main」，不要求任何格式），當作模型看得到、使用者看不到的 context（commander 的規則則在每個角色的第一則訊息附上一次）。原因是實測時內建的安全 plugin 會略過使用者層 plugin 的 `prompt.compose`（debug log：`herdr-commander: prompt.compose bypassed by cc-plugin-sec-default`），只靠系統提示的話模型根本看不到。
+Codex worker、Codex 派工者（Codex commander 開的 Claude worker 也算）、不是 bridge 開的 Claude pane，照舊打字：bridge 開的 Claude worker 直接收到內容本身（超過 30,000 字、含終端機控制碼、或第一個字是 `/`、`!`、`#` 時改成「寫進任務檔＋一行提示」；上限依 Windows 命令列 32,767 個 UTF-16 字元，實測 31,081 字送達、33,000 字失敗），其他收一行 `[herdr-job …]` 提示加任務檔。打字送出後幾秒內 pane 沒進入 working，就補一次 Enter。
+
+worker 怎麼知道怎麼交件：mod 把說明附在 worker 收到的每則訊息上（跨 session 訊息也會觸發 worker 的 `prompt.submit`）（「做完或需要決定時，把結果寫在回覆裡、結束這一輪；最後一則回覆會交給派工者；中途想報告可以 SendMessage 給 main」，不要求任何格式），當作模型看得到、使用者看不到的 context（commander 的規則則在每個角色的第一則訊息附上一次）。原因是實測時內建的安全 plugin 會略過使用者層 plugin 的 `prompt.compose`（debug log：`herdr-commander: prompt.compose bypassed by cc-plugin-sec-default`），只靠系統提示的話模型根本看不到。
 
 job 怎麼算完成（0.2.2 起，照原生背景子代理）：**Claude worker 一輪正常結束時的最後一則回覆就是結果。** worker 自己的 mod 在主迴圈一輪結束時，把引擎給的 `reason`、`isAborted` 和最後回覆 `answer` 交給 bridge（answer 走 stdin，不經命令列，所以超過 Windows 命令列 32,767 字的回覆也完整）。bridge 只看這些和自己的紀錄：
 - 這個 pane 有開著的 job，而且這一輪有收到這個 job 最新的那次送達（看這一輪的開始時間，或這一輪中途收到的最後一則 prompt 的時間，不早於送達時間；「中途收到」這種情況沒有實機測過）：
-  - `reason` 是 `answer`、沒被中斷、回覆不是空的 → 回覆記成 worker 的訊息、寫進結果檔，job 完成（`completed_via: answer`），只產生一筆 `completed` 事件。派工者只收到**一則**通知，裡面直接附上回覆（超過 6,000 字截斷，指向輸出檔），再加上「SendMessage 給它接續同一個 job；TaskStop 關掉它的 pane」。
+  - `reason` 是 `answer`、沒被中斷、回覆不是空的 → 回覆記成 worker 的訊息、寫進結果檔，job 完成（`completed_via: answer`），只產生一筆 `completed` 事件。派工者只收到**一則**通知，說它做完了、結果在哪個檔（最後一段是它的最後回覆），請派工者去讀，再加上「SendMessage 給它接續同一個 job；TaskStop 關掉它的 pane」。通知本身不帶 worker 寫的內容（見下面「通知只說去讀哪裡」）。
+- 還有待寄的訊息（`pending`）、或這個 job 的訊息根本沒送到過 worker（送不到且撤回）→ 這一輪不算這個 job，什麼都不做。
   - 被中斷、refusal、error、回覆是空的 → 不完成；派工者只收到一次「停下來了，但沒有交出結果」（事件 `stopped_without_answer`）。
 - 沒有開著的 job（job 已完成，或使用者自己在 worker 的 pane 打字）→ 什麼都不做，不轉給 commander。
 
 worker 中途用 SendMessage 傳給 main 的訊息照樣立刻轉給派工者（一則「傳了訊息」通知），但不算交件；那一輪結束時仍用最後一則回覆完成。之前（0.2.1）要「傳過 SendMessage＋停下來」才算完成，每次交件派工者都會收到兩則通知（先「傳了訊息」，3～25 秒後「完成了」），第二則沒有新資訊卻讓 commander 多跑一輪；而且我們接管的是 Agent 工具，照原生背景子代理的做法比較一致，所以改掉。
 
-派工者被通知的時機：job 完成（附回覆）、worker 中途傳來訊息、停了沒交結果、worker 開不起來或卡在信任對話框。通知用 plugin prompt 送進來，要等 session 閒下來。
+交件通知怎麼送到派工者（0.3.0 起）：
+- 跨 session 的 job（上面的範圍）：worker 中途 SendMessage 給 main、以及一輪結束時的「完成（附回覆）」或「停了沒交結果」，都由 **worker 的 mod 用跨 session 訊息寄給派工者**。bridge 決定完成與否後，回傳派工者的 session id 和事件資料，worker 的 mod 用跟派工者自己的通知同一份文字（`hooks/pure.ts` 的 `eventText`、`noticeText`，兩邊共用）寄出，再回報結果。bridge 不能 import TypeScript，所以回傳的是資料、文字由 mod 組。
+- 防重複：bridge 回傳時就把那個事件標成「由 worker 寄送中」（`relay: sending`）；寄成功標成已寄（`sent`）。派工者的 mod 輪詢時跳過已寄的、以及寄送中且未滿 30 秒的；寄失敗（`failed`）或超過 30 秒沒結果，就照舊由派工者的 mod 在閒下來時用 plugin 訊息補通知（備援，不經輸入框）。派工者在等這種事件時會繼續輪詢。
+- 其他通知（Codex worker 完成、worker 開不起來或卡在信任對話框、送不到、worker 寄失敗的補通知）由派工者自己的 mod 輪詢後送：
+  - 派工者閒著：用 plugin 提示詞送進來，開新的一輪。
+  - 派工者這一輪還在跑：先留著，**附在它下一次工具呼叫的結果後面**（工具結果的 context，模型當場讀到、使用者看不到），不用等這一輪結束。這一輪如果沒有再呼叫工具就結束，結束時改用提示詞送。2026-10-19 實機確認：Codex worker 01:24:34 完成，派工者在同一輪的第 18 次工具結果（`Get-Date`）就讀到通知，debug log 裡沒有另外送提示詞。
+  - 試過、不能用：plugin 寄跨 session 訊息給自己的 session，引擎會拒絕（`no live session on this machine has id <自己的 id>`）。
+  - SendMessage 當場寄失敗的那次已經寫在工具結果裡，不會再通知一次。
+- 通知只說去讀哪裡（2026-10-19 使用者決定，把通知和內容拆開）：通知不帶 worker 寫的內容（包括 Codex 的一行摘要），只說誰、哪個 job、發生什麼事，以及去讀哪個檔：job 完成指向結果檔，中途訊息指向 worker 輸出檔裡最新的一段「worker → sender」。Claude worker 寄給派工者的跨 session 訊息用同一份文字。唯一例外：不是 bridge 開的 pane 中途傳來的訊息沒有輸出檔可指，照舊附原文。
 
 一個 worker 一次只做一個 job，其他 job 排隊；想平行就多開幾個 worker。
 
@@ -129,15 +148,16 @@ Claude 與 Codex 共用同一份 lease（`<runtime>/<workspace>/lease.json`）�
 - worker 一律不能再開 worker（防遞迴）：bridge 開的 pane 都帶 `HERDR_COMMANDER_ROLE=worker`。
 - TaskStop 只能結束自己開的 worker（送 Ctrl+C 並關 pane，不問人，跟原生 TaskStop 一樣）；別人開的 pane 一律拒絕。面板按鈕（你按的，帶 `--by-user`）可以對任何非自己的 pane 送 Esc／Ctrl+C。
 - job 完成的證據（都是 bridge 的紀錄與引擎給的結束原因，不看文字格式）：Claude worker 自己的 mod 回報這一輪以 `answer` 正常結束、沒被中斷、回覆不是空的（回覆本身就是結果）；Codex worker 呼叫 `herdr_job_complete`（帶 `result` 全文，由 bridge 寫成結果檔），或結果檔帶檔頭 `job_id: <id>`。agent 的 idle／done／unknown 一律不算完成；送達失敗記為 `delivery_unknown`，不自動重送。
-- 完成時通知派工者一次（job 的 `woken`）：Claude 派工者由 mod 自己輪詢喚醒；Codex 派工者在 idle 時收到一行 prompt，忙碌時由它的 MCP server 每 10 秒重試。
+- 完成時通知派工者一次（job 的 `woken`）：Claude 派工者由 mod 自己輪詢喚醒（跨 session 的 job 由 worker 的 mod 直接寄，失敗或 30 秒沒結果才由派工者的 mod 補）；Codex 派工者在 idle 時收到一行 prompt，忙碌時由它的 MCP server 每 10 秒重試。
+- 跨 session 的 job 送不到時，**不會改成打字進 worker 的輸入框**：job 標成「送不到」並附原因，由派工者決定。跨 session 訊息只由 mod 寄（`$.session.send`），bridge 只記錄寄給哪個 session、寄什麼；mod 自己寄的訊息不會再被自己的 `session.send` hook 轉回 bridge。
 - worker 開起來就卡在 prompt（資料夾信任、登入）時，不送任務，回報 `blocked`，由你到那個 pane 處理。
 - MCP 只走 STDIO，沒有網路 listener。
 
 ## 測試
 
 ```powershell
-cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 50 項，假 herdr，不碰實機
-cd ..; claude plugin validate .; claude plugin test .                            # 34 項；validate 也會檢查 marketplace.json
+cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 63 項，假 herdr，不碰實機
+cd ..; claude plugin validate .; claude plugin test .                            # 49 項；validate 也會檢查 marketplace.json
 ```
 
 在 herdr 的 worker pane 裡跑測試時，要先清掉 `HERDR_*` 環境變數（Git Bash：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_COMMANDER_ROLE ...`），否則 bridge 會把測試本身當成 worker，開 worker 的測試會失敗。
@@ -225,11 +245,13 @@ cd ..; claude plugin validate .; claude plugin test .                           
 
 ## 已知限制與未做項目
 
-- herdr worker 不會出現在 Claude Code 原生的背景任務清單、不會觸發 SubagentStart／SubagentStop；通知的外觀和原生不同，要等 session 閒下來才送到。
+- herdr worker 不會出現在 Claude Code 原生的背景任務清單、不會觸發 SubagentStart／SubagentStop；通知的外觀和原生不同。Claude worker 交給 Claude 派工者的是跨 session 訊息；其餘通知在派工者忙碌時附在下一次工具結果後面，所以派工者卡在一個很久的工具上（例如跑 10 分鐘的測試）時，要等那個工具結束才看到。
+- 跨 session 訊息「送達」只代表進了對方的佇列：雙方權限模式不同而被擋下等使用者同意時，結果仍是送達，bridge 偵測不到。目前讀不到派工者即時的權限模式，worker 用使用者設定的預設模式啟動；派工者用 shift+tab 或 `--permission-mode` 改過模式時，就可能發生這種情況。
+- SendMessage 送不到時，工具結果是 `{ success: false, message }`；SendMessage 的輸出型別是 `unknown`，核心收不收 `success: false` 沒有實機確認過（`success: true` 有）。
 - Agent 只接管兩個 herdr 類型；`general-purpose`、`Explore` 等其他類型照原生跑（已定）。背景命令與 Monitor 也一律原生（已定）。
 - 「讓 Claude 感覺不到 herdr」（例如 worker 的系統提示、通知外觀）這版沒做。
 - worker 被手動關掉 pane 時，它開著的 job 不會自動結束，要用 TaskStop。
-- 派工者在 worker 正在忙（working）時送來的訊息，如果 Enter 被吃掉不會補（只在 pane 沒進入 working 時才補）。
+- 打字送達的情況（Codex worker 等），派工者在 worker 正在忙（working）時送來的訊息，如果 Enter 被吃掉不會補（只在 pane 沒進入 working 時才補）。
 - 兩個 bridge 行程同時對同一個 worker 動作（例如派工者送訊息的同一刻 worker 完成）沒有鎖，只在完成和第一次送出前重讀狀態，縮小時間窗。
 
 - **沒做**：Codex App Server bridge（官方仍標 experimental，未經你同意不引入）、`events.subscribe` 推播（CLI 沒有對應指令，要另寫連 `herdr.sock` 的程式；目前用輪詢）、`herdr_worktree` 工具、ACK／去重的完整訊息協定（P2，目前只靠 job_id＋結果檔）。

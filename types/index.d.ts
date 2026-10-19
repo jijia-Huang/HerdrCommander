@@ -39,6 +39,10 @@ export type JobEvent = {
   by?: string
   /** How a job completed: answer (a Claude worker's final reply), tool, result_file, or message (before 0.2.2). */
   via?: string
+  /** An event its Claude worker sends the sender by Claude's cross-session messages: sending, sent or failed. */
+  relay?: string
+  /** When `relay` last changed (ISO). */
+  relay_at?: string
 }
 
 export type JobRow = {
