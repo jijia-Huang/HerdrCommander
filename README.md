@@ -19,7 +19,7 @@ claude plugin install herdr-commander@herdr-commander
 
 裝好後所有 Claude session 都會載入它，但**不在 herdr 裡時完全不生效**（每個 hook 都先檢查 `HERDR_ENV`／`HERDR_PANE_ID`）。
 
-更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.3.0`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
+更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.3.1`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
 
 ```powershell
 claude plugin update herdr-commander@herdr-commander
@@ -80,7 +80,7 @@ worker 怎麼知道怎麼交件：mod 把說明附在 worker 收到的每則訊�
 
 job 怎麼算完成（0.2.2 起，照原生背景子代理）：**Claude worker 一輪正常結束時的最後一則回覆就是結果。** worker 自己的 mod 在主迴圈一輪結束時，把引擎給的 `reason`、`isAborted` 和最後回覆 `answer` 交給 bridge（answer 走 stdin，不經命令列，所以超過 Windows 命令列 32,767 字的回覆也完整）。bridge 只看這些和自己的紀錄：
 - 這個 pane 有開著的 job，而且這一輪有收到這個 job 最新的那次送達（看這一輪的開始時間，或這一輪中途收到的最後一則 prompt 的時間，不早於送達時間；「中途收到」這種情況沒有實機測過）：
-  - `reason` 是 `answer`、沒被中斷、回覆不是空的 → 回覆記成 worker 的訊息、寫進結果檔，job 完成（`completed_via: answer`），只產生一筆 `completed` 事件。派工者只收到**一則**通知，說它做完了、結果在哪個檔（最後一段是它的最後回覆），請派工者去讀，再加上「SendMessage 給它接續同一個 job；TaskStop 關掉它的 pane」。通知本身不帶 worker 寫的內容（見下面「通知只說去讀哪裡」）。
+  - `reason` 是 `answer`、沒被中斷、回覆不是空的 → 回覆記成 worker 的訊息、寫進結果檔，job 完成（`completed_via: answer`），只產生一筆 `completed` 事件。派工者只收到**一則**通知，裡面直接附上回覆（跟原生背景子代理一樣；超過 6,000 字截斷，指向輸出檔），再加上「SendMessage 給它接續同一個 job；TaskStop 關掉它的 pane」。
 - 還有待寄的訊息（`pending`）、或這個 job 的訊息根本沒送到過 worker（送不到且撤回）→ 這一輪不算這個 job，什麼都不做。
   - 被中斷、refusal、error、回覆是空的 → 不完成；派工者只收到一次「停下來了，但沒有交出結果」（事件 `stopped_without_answer`）。
 - 沒有開著的 job（job 已完成，或使用者自己在 worker 的 pane 打字）→ 什麼都不做，不轉給 commander。
@@ -95,7 +95,7 @@ worker 中途用 SendMessage 傳給 main 的訊息照樣立刻轉給派工者（
   - 派工者這一輪還在跑：先留著，**附在它下一次工具呼叫的結果後面**（工具結果的 context，模型當場讀到、使用者看不到），不用等這一輪結束。這一輪如果沒有再呼叫工具就結束，結束時改用提示詞送。2026-10-19 實機確認：Codex worker 01:24:34 完成，派工者在同一輪的第 18 次工具結果（`Get-Date`）就讀到通知，debug log 裡沒有另外送提示詞。
   - 試過、不能用：plugin 寄跨 session 訊息給自己的 session，引擎會拒絕（`no live session on this machine has id <自己的 id>`）。
   - SendMessage 當場寄失敗的那次已經寫在工具結果裡，不會再通知一次。
-- 通知只說去讀哪裡（2026-10-19 使用者決定，把通知和內容拆開）：通知不帶 worker 寫的內容（包括 Codex 的一行摘要），只說誰、哪個 job、發生什麼事，以及去讀哪個檔：job 完成指向結果檔，中途訊息指向 worker 輸出檔裡最新的一段「worker → sender」。Claude worker 寄給派工者的跨 session 訊息用同一份文字。唯一例外：不是 bridge 開的 pane 中途傳來的訊息沒有輸出檔可指，照舊附原文。
+- 通知帶不帶內容（2026-10-19 使用者決定）：**Claude worker 照原生的方式**，中途訊息和最後回覆直接附在通知裡（超過 6,000 字截斷，指向輸出檔）；**Codex worker（用工具或結果檔交件）的通知跟內容拆開**，只說它做完了、新的結果在哪個檔、請去讀，連它的一行摘要都不附。
 
 一個 worker 一次只做一個 job，其他 job 排隊；想平行就多開幾個 worker。
 
@@ -157,7 +157,7 @@ Claude 與 Codex 共用同一份 lease（`<runtime>/<workspace>/lease.json`）�
 
 ```powershell
 cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 63 項，假 herdr，不碰實機
-cd ..; claude plugin validate .; claude plugin test .                            # 49 項；validate 也會檢查 marketplace.json
+cd ..; claude plugin validate .; claude plugin test .                            # 50 項；validate 也會檢查 marketplace.json
 ```
 
 在 herdr 的 worker pane 裡跑測試時，要先清掉 `HERDR_*` 環境變數（Git Bash：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_COMMANDER_ROLE ...`），否則 bridge 會把測試本身當成 worker，開 worker 的測試會失敗。

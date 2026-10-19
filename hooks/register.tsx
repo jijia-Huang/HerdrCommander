@@ -233,8 +233,8 @@ type NewWorker = { worker: RawWorker & { output_file: string }; job: { job_id: s
 function launchedContext(out: NewWorker): string {
   const id = out.worker.herdr_id
   const answers = out.worker.worker_kind === 'claude'
-    ? `Its task, and whatever you SendMessage to ${id} later, reach it by Claude's cross-session messages. When it finishes or sends you a message along the way, you are told (by a cross-session message from it) which file to Read for what it wrote. You are also told if it stops without a result, or if a message cannot be delivered.`
-    : 'You are told when it completes, sends you a message, or stops without a result, with the file to Read for what it wrote.'
+    ? `Its task, and whatever you SendMessage to ${id} later, reach it by Claude's cross-session messages. Its final reply when it finishes, or a message it sends along the way, comes back to you the same way (a cross-session message from it). You are also told if it stops without a result, or if a message cannot be delivered.`
+    : 'You are told when it completes, with the result file to Read, or if it cannot start.'
   return [
     `herdr: ${id} runs as a herdr worker in its own visible pane (a separate session, not an in-process subagent); the pane opens in the background, up to ~90 s.`,
     `Its outputFile is a short Markdown log the herdr bridge keeps (the task, every message both ways, and the worker's latest screen on each Read): Read it whenever you like, whatever the line above says about the file.`,
