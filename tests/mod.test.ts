@@ -538,6 +538,45 @@ describe('Claude workers by Claude\'s cross-session messages', () => {
     expect(world.bridge.filter(call => call.command === 'worker-session')).toHaveLength(2)
   })
 
+  test('a worker keeps reporting its session every few seconds until the bridge records it, then stops', async ($, on) => {
+    const world = worldOf(on, { ...HERDR_ENV, HERDR_COMMANDER_ROLE: 'worker' })
+    const clock = mock.clock(on)
+    const reports = () => world.bridge.filter(call => call.command === 'worker-session').length
+    world.replies['worker-session'] = { recorded: false }
+    await $.session.start(SESSION)
+    await clock.advance(10)
+    expect(reports()).toBe(1)
+    // No prompt comes (no work reaches a worker without a session): the timer tries again.
+    await clock.advance(5000)
+    await clock.advance(5000)
+    expect(reports()).toBe(3)
+    world.replies['worker-session'] = { recorded: true }
+    await clock.advance(5000)
+    expect(reports()).toBe(4)
+    await clock.advance(30000)
+    expect(reports()).toBe(4)
+  })
+
+  test('a worker gives up reporting after a while; a prompt then tries once more', async ($, on) => {
+    const world = worldOf(on, { ...HERDR_ENV, HERDR_COMMANDER_ROLE: 'worker' })
+    const clock = mock.clock(on)
+    on('prompt.submit', ($, e) => ({ text: e.text }) as never)
+    const reports = () => world.bridge.filter(call => call.command === 'worker-session').length
+    world.replies['worker-session'] = { recorded: false }
+    await $.session.start(SESSION)
+    for (let i = 0; i < 70; i += 1) {
+      await clock.advance(5000)
+    }
+    const tried = reports()
+    expect(tried).toBe(61)
+    await clock.advance(60000)
+    expect(reports()).toBe(tried)
+    world.replies['worker-session'] = { recorded: true }
+    await $.prompt.submit({ text: 'are you there?' } as never)
+    await clock.advance(10)
+    expect(reports()).toBe(tried + 1)
+  })
+
   test('a worker\'s SendMessage to main goes to its Claude sender as a cross-session message, in the sender\'s notice words', async ($, on) => {
     const world = worldOf(on, { ...HERDR_ENV, HERDR_PANE_ID: 'wA:p9', HERDR_COMMANDER_ROLE: 'worker' })
     mock.clock(on)

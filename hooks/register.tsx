@@ -71,6 +71,18 @@ const stAnnounced = atom({ plugin: 'herdr-commander', key: 'announced' } as cons
 const PANE_ID_UI = 'commander'
 
 const NOTIFY_GAP_MS = 30000
+/**
+ * A worker's session report: one bridge call took 8.4 s on a loaded machine
+ * (2026-10-20), so it gets 30 s, and it is tried again every few seconds until
+ * the bridge records it (no work can reach the worker before that, so no
+ * prompt would ever retry it). The bridge waits SESSION_WAIT_MS (180 s) from
+ * herdr seeing the process; this keeps trying a while past that.
+ */
+const SESSION_REPORT_TIMEOUT_MS = 30000
+const SESSION_RETRY_MS = 5000
+const SESSION_RETRY_FOR_MS = 300000
+/** The sender's send-take / send-done calls; a lost send-done leaves its job "sending" until it times out. */
+const SEND_CALL_TIMEOUT_MS = 30000
 
 // Module state (a reload starts it over; $.state keeps the rest).
 let pollTimer: Timer | null = null
@@ -105,6 +117,10 @@ let adopting: Promise<Gate> | null = null
 const permissionMode: string | null = null
 /** The Claude session this worker last reported to the bridge (the address its work is sent to). */
 let sessionReported: string | null = null
+/** Retries the session report until the bridge records it (see SESSION_RETRY_MS). */
+let sessionRetryTimer: Timer | null = null
+/** A session report is on its way (a slow one must not pile up behind the retry timer). */
+let reportingSession = false
 /** Cross-session sends of this pane, one after another (a tick and a SendMessage may both send). */
 let sendChain: Promise<unknown> = Promise.resolve()
 /** The main loop's turn is running (turn.start / a prompt, until turn.complete). */
@@ -172,7 +188,7 @@ async function adopt($: EngineInterface, pane: Gate): Promise<Gate> {
   await update($, stGate, () => pane)
   if (pane.role === 'worker') {
     // A new conversation is a new session: its work is sent there now.
-    later($, () => reportSession($))
+    keepReportingSession($)
     return pane
   }
   const held = await bridge<{ lease: { pane_id: string } | null }>($, 'lease', {}, false, 8000).catch(() => null)
@@ -242,20 +258,58 @@ function launchedContext(out: NewWorker): string {
   ].join('\n')
 }
 
-/** A worker tells the bridge its Claude session (once per conversation): where its work is sent. */
-async function reportSession($: EngineInterface): Promise<void> {
+/**
+ * A worker tells the bridge its Claude session (once per conversation): where
+ * its work is sent. True once it is recorded, or when there is nothing to report.
+ */
+async function reportSession($: EngineInterface): Promise<boolean> {
   const g = await read($, stGate)
   if (!g.inHerdr || g.role !== 'worker' || !options.takeover) {
-    return
+    return true
   }
   const sessionId = await $.session.id()
   if (sessionId === sessionReported) {
-    return
+    return true
   }
-  const out = await bridge<{ recorded: boolean }>($, 'worker-session', { session_id: sessionId }, false, 8000).catch(() => null)
-  if (out?.recorded) {
-    sessionReported = sessionId
+  if (reportingSession) {
+    return false
   }
+  reportingSession = true
+  try {
+    const out = await bridge<{ recorded: boolean }>($, 'worker-session', { session_id: sessionId }, false, SESSION_REPORT_TIMEOUT_MS).catch(() => null)
+    if (out?.recorded) {
+      sessionReported = sessionId
+      return true
+    }
+    return false
+  } finally {
+    reportingSession = false
+  }
+}
+
+/** Reports this worker's session now, and again every few seconds until the bridge has it. */
+function keepReportingSession($: EngineInterface): void {
+  stopReportingSession()
+  let tries = Math.ceil(SESSION_RETRY_FOR_MS / SESSION_RETRY_MS)
+  const attempt = async () => {
+    if (await reportSession($)) {
+      stopReportingSession()
+    }
+  }
+  sessionRetryTimer = $.clock.every(SESSION_RETRY_MS, () => {
+    tries -= 1
+    if (tries < 0) {
+      stopReportingSession()
+      return
+    }
+    void attempt().catch(() => {})
+  })
+  later($, attempt)
+}
+
+function stopReportingSession(): void {
+  sessionRetryTimer?.cancel()
+  sessionRetryTimer = null
 }
 
 type SendItem = { job_id: string; send_id: string; session_id: string; text: string }
@@ -277,14 +331,19 @@ async function sendRounds($: EngineInterface): Promise<Sent[]> {
   const out: Sent[] = []
   // What joins a job while its send is out waits for it: a second round sends that.
   for (let round = 0; round < 3; round += 1) {
-    const taken = await bridge<{ items: SendItem[]; failed: Array<{ job_id: string; reason: string; event: string }> }>($, 'send-take', {}, false, 15000)
+    const taken = await bridge<{ items: SendItem[]; failed: Array<{ job_id: string; reason: string; event: string }> }>($, 'send-take', {}, false, SEND_CALL_TIMEOUT_MS)
     out.push(...taken.failed.map(one => ({ jobId: one.job_id, delivered: false, reason: one.reason, event: one.event })))
     let again = false
     for (const item of taken.items) {
       const sent = await $.session.send({ to: { sessionId: item.session_id }, text: item.text })
         .catch((error: unknown) => ({ isDelivered: false as const, reason: errorText(error) }))
       const reason = sent.isDelivered ? '' : sent.reason || 'not delivered'
-      const done = await bridge<{ job: RawJob; event?: string }>($, 'send-done', { job_id: item.job_id, send_id: item.send_id, delivered: sent.isDelivered, reason }, false, 15000).catch(() => null)
+      // Tried twice: a lost result leaves the job "sending" until the bridge
+      // gives up on it, and the sender is then told it may not have arrived.
+      const doneArgs = { job_id: item.job_id, send_id: item.send_id, delivered: sent.isDelivered, reason }
+      const done = await bridge<{ job: RawJob; event?: string }>($, 'send-done', doneArgs, false, SEND_CALL_TIMEOUT_MS)
+        .catch(() => bridge<{ job: RawJob; event?: string }>($, 'send-done', doneArgs, false, SEND_CALL_TIMEOUT_MS))
+        .catch(() => null)
       out.push({ jobId: item.job_id, delivered: sent.isDelivered, reason, event: done?.event })
       again ||= done?.job.status === 'pending'
     }
@@ -646,7 +705,7 @@ export const register: Register = (on, rawOptions) => {
       later($, () => bridge($, 'report-session', { agent: 'claude', session_id: sessionId }))
     }
     if (role === 'worker') {
-      later($, () => reportSession($))
+      keepReportingSession($)
     }
     return next(e)
   })
@@ -663,6 +722,7 @@ export const register: Register = (on, rawOptions) => {
     }
     if (g.inHerdr) {
       stopPolling()
+      stopReportingSession()
       previewTimer?.cancel()
       if (e.reason === 'clear' || e.reason === 'resume') {
         // The process goes on in another conversation (gateOf takes it up
@@ -705,7 +765,7 @@ export const register: Register = (on, rawOptions) => {
       want($, 'working')
     }
     if (g.role === 'worker' && sessionReported === null) {
-      // The report at its start did not get through: once more.
+      // The reports since its start have not got through (or gave up): once more.
       later($, () => reportSession($))
     }
     const brief = g.role === 'worker' || briefedRole !== g.role

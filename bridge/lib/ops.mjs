@@ -21,8 +21,13 @@ const NAME = /^[a-z][a-z0-9_-]{0,31}$/
  */
 const ACTIVE_JOB = new Set(['queued', 'sent', 'delivery_unknown', 'pending', 'sending', 'undeliverable'])
 const OPEN_JOB = new Set(['sent', 'delivery_unknown', 'pending', 'sending', 'undeliverable'])
-/** How long a running Claude worker may go without reporting its session before its job is undeliverable. */
-const SESSION_WAIT_MS = 60000
+/**
+ * How long a running Claude worker may go without reporting its session before
+ * its job is undeliverable. Counted from herdr seeing the process, well before
+ * Claude has loaded its plugins: on a loaded machine (2026-10-20) that took
+ * over 60 s, and the worker's mod keeps reporting for longer (register.tsx).
+ */
+const SESSION_WAIT_MS = 180000
 /** How long a send the sender's mod took may go without its result before its job is undeliverable. */
 const SEND_WAIT_MS = 60000
 /** The permission modes Claude Code takes (`claude --permission-mode`). */

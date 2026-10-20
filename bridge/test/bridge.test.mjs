@@ -783,15 +783,19 @@ test('a queued job of another Claude sender waits to be sent when the worker\'s 
   assert.equal(prompts('wA:p9').length, 0)
 })
 
-test('a Claude worker running 60 s without reporting its session: the job is undeliverable', async () => {
+test('a Claude worker running 180 s without reporting its session: the job is undeliverable', async () => {
   const { herdrId, jobId } = await crossWorker({ session: null })
   assert.deepEqual(ops.sendTake(me), { items: [], failed: [] })
   assert.equal(new Store('wA').getJob(jobId).status, 'pending', 'still waiting')
   const store = new Store('wA')
+  // A slow start (Claude loading its plugins on a busy machine) is still waited for.
   store.putWorker({ ...store.getWorker(herdrId), running_at: new Date(Date.now() - 61000).toISOString() })
+  assert.deepEqual(ops.sendTake(me), { items: [], failed: [] })
+  assert.equal(store.getJob(jobId).status, 'pending', 'still waiting after 61 s')
+  store.putWorker({ ...store.getWorker(herdrId), running_at: new Date(Date.now() - 181000).toISOString() })
   const out = ops.sendTake(me)
   assert.equal(out.items.length, 0)
-  assert.match(out.failed[0].reason, /over 60 s without reporting its Claude session/)
+  assert.match(out.failed[0].reason, /over 180 s without reporting its Claude session/)
   const job = store.getJob(jobId)
   assert.deepEqual([job.status, job.events.at(-1).type], ['undeliverable', 'undeliverable'])
   assert.equal(prompts('wA:p9').length, 0)

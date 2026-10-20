@@ -19,7 +19,7 @@ claude plugin install herdr-commander@herdr-commander
 
 裝好後所有 Claude session 都會載入它，但**不在 herdr 裡時完全不生效**（每個 hook 都先檢查 `HERDR_ENV`／`HERDR_PANE_ID`）。
 
-更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.3.1`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
+更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.3.2`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
 
 ```powershell
 claude plugin update herdr-commander@herdr-commander
@@ -65,11 +65,11 @@ claude plugin update herdr-commander@herdr-commander
 | `herdr_worker_spawn`（唯一保留的工具，commander／plain） | 在**別的**資料夾開 worker（`cwd`、`kind`、`task` 必填，`name` 選填）；給這個 session 自己的資料夾會被拒，請改用 Agent |
 
 Claude worker 怎麼收到工作（0.3.0 起）：bridge 開的 Claude worker、由 Claude 派工者（有這個 mod 的 Claude session）派工時，任務和之後用 SendMessage 送來的訊息都走 **Claude Code 內建的跨 session 訊息**，不再打字進輸入框：
-- worker 的 mod 啟動時（以及 `/clear`、`/resume` 換對話後）把自己的 session id 交給 bridge，記在它的 worker 紀錄上；派工者的 mod 在 Agent、`herdr_worker_spawn`、SendMessage 時帶上自己的 session id，記在 job 上（每次都更新，派工者換過對話也找得到）。
+- worker 的 mod 啟動時（以及 `/clear`、`/resume` 換對話後）把自己的 session id 交給 bridge，記在它的 worker 紀錄上。沒記到就每 5 秒再試，直到記到為止，最多試 5 分鐘；每次等 bridge 最多 30 秒。之後收到 prompt 時也會再試一次（0.3.2 起；之前只試一次、等 8 秒，機器一慢就永遠回報不了，見下面「送不到」）。派工者的 mod 在 Agent、`herdr_worker_spawn`、SendMessage 時帶上自己的 session id，記在 job 上（每次都更新，派工者換過對話也找得到）。
 - bridge 不打字，只把 job 標成「待寄」（`pending`），保存要寄的內容：訊息本身，不加任何標頭；第一份是任務加上還沒送的訊息。沒有長度限制，也不走任務檔（不經命令列）。
 - 派工者的 mod 寄出：SendMessage 被接管時當場寄，Agent 開好 worker 時寄一次，輪詢時有待寄的也寄。取走的同時 bridge 先記送達時間、狀態改成「寄送中」（`sending`），寄完再回報。先記時間的原因：worker 可能在 mod 回報之前就收到、做完、結束這一輪，而完成判斷要看「這一輪有沒有收到最新的送達」。
 - worker 收到的是一則跨 session 訊息：閒置時會開新的一輪，忙碌時在它下一次工具結果後面送進去；模型知道這不是使用者打的。
-- **送不到時絕對不改回打字**（使用者決定）：撤回這次送達（訊息回到未送）、job 標成「送不到」（`undeliverable`）並記一筆事件帶原因，SendMessage 的工具結果直接說「送不到：原因」，由派工者決定重送、TaskStop 或問人。之後再 SendMessage 給同一個 worker，會接續同一個 job 重送。worker 開始跑之後超過 60 秒都沒回報 session id，也算送不到。
+- **送不到時絕對不改回打字**（使用者決定）：撤回這次送達（訊息回到未送）、job 標成「送不到」（`undeliverable`）並記一筆事件帶原因，SendMessage 的工具結果直接說「送不到：原因」，由派工者決定重送、TaskStop 或問人。之後再 SendMessage 給同一個 worker，會接續同一個 job 重送。worker 開始跑之後超過 180 秒都沒回報 session id，也算送不到（0.3.2 前是 60 秒；這段時間從 herdr 看到 Claude 程序就開始算，Claude 還要載完 plugin 才會回報，2026-10-20 機器變慢時就要 60 秒以上）。
 - 權限模式：目前**讀不到派工者即時的權限模式**，worker 用使用者設定的預設模式啟動。派工者如果用 shift+tab 或 `--permission-mode` 改過模式，雙方模式不同，跨 session 訊息可能會被擋下等人同意。（原本打算從 classic hook 輸入的 `permission_mode` 取，但實機 debug log 顯示 `classic.SessionStart`、`classic.UserPromptSubmit` 都被內建安全 plugin 略過，永遠不會跑，所以拿掉了。帶 `permission_mode` 給 bridge、bridge 加 `--permission-mode` 的程式還在，只是現在沒有來源給它值。）
 - 派工者的模型照通知裡的 `from=` 地址直接回 worker（不經 SendMessage 的接管，bridge 本來看不到）：worker 的 mod 在 `session.receive` 收到別的 session 的模型寫的訊息時（不是這個 plugin 自己寄的），把原文和收到的時間交給 bridge，一律當作這個 worker 的派工者傳來的：有進行中的 job 就附加進去；沒有就重新打開派工者最近一個已完成的 job；都沒有就不記。送達時間用 worker 收到的時間，所以這一輪結束時照常算完成、照常把結果寄回派工者。
 - 寄送中卡住：派工者的 mod 取走之後超過 60 秒都沒回報寄送結果（例如程序中途停了），下次取件時標成送不到，原因是「寄送結果一直沒有回來，訊息可能到了、也可能沒到，重送前先 Read worker 的輸出檔」。這種情況不撤回送達，worker 如果其實收到並回覆了，job 照常完成。
@@ -157,7 +157,7 @@ Claude 與 Codex 共用同一份 lease（`<runtime>/<workspace>/lease.json`）�
 
 ```powershell
 cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 63 項，假 herdr，不碰實機
-cd ..; claude plugin validate .; claude plugin test .                            # 50 項；validate 也會檢查 marketplace.json
+cd ..; claude plugin validate .; claude plugin test .                            # 52 項；validate 也會檢查 marketplace.json
 ```
 
 在 herdr 的 worker pane 裡跑測試時，要先清掉 `HERDR_*` 環境變數（Git Bash：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_COMMANDER_ROLE ...`），否則 bridge 會把測試本身當成 worker，開 worker 的測試會失敗。
