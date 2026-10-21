@@ -145,7 +145,24 @@ worker 開在 commander 自己的資料夾，其他行為跟 `herdr-commander:cl
 
 ### SkillPool profile（完整檔）
 
-見第 2 節。SkillPool 保證 `skillpool list --json` 的 `name`、`description`、`whenToUse`、`errors` 是穩定介面。
+檔案內容見第 2 節，放到 `%LOCALAPPDATA%\herdr-commander\launchers\skillpool.json` 就好。SkillPool 本身不提 herdr，跟 herdr 有關的事都記在這裡。SkillPool 對外保證的只有兩件事：
+
+- 任何工具改成執行 `skillpool <profile> [claude 參數…]`，就能套用那個 profile；
+- `skillpool list --json` 的 `name`、`description`、`whenToUse`、`errors` 是穩定介面（`path`、`skills` 不保證）。
+
+**用 SkillPool 開 worker 的注意事項：**
+
+- **profile 不能關掉 herdr-commander。** 關掉的話，worker 起得來，但永遠不會回報 session，任務也送不進去（見第 5 節）。具體來說：
+  - `plugins.off` 不要列 herdr-commander；
+  - 用 `mcp.only` 時，要把 herdr-commander 列進去，否則它註冊的工具（例如 `herdr_worker_spawn`）會被擋。這條對 commander 自己的 session 也適用。
+- **worker 裡不要中途 `/skillpool <profile>`。** 一律在開 worker 時就帶 profile。中途切換會先跳「加入資料夾」的確認框，pane 會卡在 blocked 等人回答；接著還會壓縮對話。
+- **後面接的參數會蓋過 profile 的設定**：Agent 給的 `model`（`--model`）會蓋過 profile.json 的 model；`--name` 也一樣。
+- **兩種派工方式**：
+  - SkillPool 產生的原生 subagent `skillpool-<profile>`：在 session 內跑，便宜；
+  - 這裡的 `herdr-commander:skillpool-<profile>`：獨立 pane，跑完整 profile。
+  
+  兩者差別見第 3 節的表。只想要 pane worker 時，可以在 profile.json 設 `"agent": false`，關掉 SkillPool 產生的那個原生 agent。
+- 程序樹是 `skillpool.cmd → python → claude`，herdr 一樣認得出 Claude（實測 29 秒）。TaskStop 直接關掉 pane 時，SkillPool 的暫存檔會留到下次執行 `skillpool` 時才清掉。
 
 ### 固定用某個 model 的 wrapper（沒有參數）
 
@@ -230,4 +247,4 @@ node "$env:USERPROFILE\.claude\plugins\cache\herdr-commander\herdr-commander\<�
 3. **把檔案內容給使用者看，取得同意後**才寫進 `%LOCALAPPDATA%\herdr-commander\launchers\`。
 4. 跑第 5 節的 `launchers` 指令，確認 `errors` 是空的、`choices` 正確。
 5. 請使用者新開一個 session，用 `herdr_worker_spawn` 或新的 agent 類型開一個 worker 測試：pane 起得來、worker 有回報 session（`runtime\<workspace>\workers\*.json` 裡有 `session_id`）、任務送得到。
-6. 在插件的 README 寫一段「接上 herdr-commander」：附上這份 JSON，並註明格式以本文件為準。
+6. 啟動器檔和「搭配 herdr 時的注意事項」都寫在本文件第 4 節，新增一個範例小節，插件那邊不用提 herdr。插件只需要讓它的啟動指令和選項清單的輸出格式保持穩定。SkillPool 就是這樣做的。
