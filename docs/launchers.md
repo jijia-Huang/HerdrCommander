@@ -18,6 +18,8 @@ herdr-commander 不認得任何插件的名字，只照檔案內容做事。所�
 - 一個檔就是一個啟動器，檔名（不含 `.json`）就是啟動器的名字。
 - 只讀這一個使用者層的資料夾。專案資料夾裡的檔案**不會**被當成啟動器，所以 clone 一個 repo 不會被偷偷加進啟動器。
 - 改完檔案後，要等新開的 session（或 `/reload-plugins`）才會生效。Agent 類型和工具說明是在 session 啟動時讀的。
+  - session 啟動時，會先讀上一次的清單快取（`runtime\launchers.json`），讓第一輪就有 agent 類型；接著在背景重新讀登記表、執行選項指令。
+  - 所以剛新增的啟動器，在第一個新 session 裡大約要幾秒後才出現；之後的 session 從第一輪就有。
 
 ### 安全：這個資料夾的信任等級跟 settings 的 hooks 一樣
 
@@ -102,6 +104,7 @@ herdr-commander 不認得任何插件的名字，只照檔案內容做事。所�
 
 - 有帶 `launcher` 時，`cwd` 可以是這個 session 自己的資料夾；沒帶的話仍然會拒絕自己的資料夾，那種情況請改用 Agent。
 - 工具說明裡會列出所有啟動器、各自的參數和可以選的值。
+- 這個工具預設藏在 ToolSearch 後面，模型要先用 `ToolSearch`（`select:mcp__herdr-commander__herdr_worker_spawn`）載入，才看得到說明和參數。沒有選項的啟動器（例如下面的 `haiku`）不會產生 agent 類型，只能從這裡用，所以要用時直接請 Claude 載入這個工具。
 
 ### Agent
 

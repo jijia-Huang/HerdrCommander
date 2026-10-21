@@ -64,16 +64,6 @@ claude plugin update herdr-commander@herdr-commander
 | 背景 Bash／PowerShell（`run_in_background`）、Monitor | **不接管，一律是 Claude 原生**（在 herdr 裡也一樣，使用者已定） |
 | `herdr_worker_spawn`（唯一保留的工具，commander／plain） | 在**別的**資料夾開 worker（`cwd`、`task` 必填；`kind` 預設 claude，`name` 選填）；給這個 session 自己的資料夾會被拒，請改用 Agent。帶 `launcher`＋`params` 時用啟動器開 Claude worker，這時自己的資料夾也可以 |
 
-### 啟動器：讓其他插件接上 herdr worker（0.4.0 起）
-
-插件想讓 worker 用自己的方式啟動 Claude 時（例如 SkillPool 的 `skillpool <profile>`），在 `%LOCALAPPDATA%\herdr-commander\launchers\` 放一個 JSON 檔就好，不用改 herdr-commander，插件也不用知道 herdr：
-
-- `herdr_worker_spawn` 多了 `launcher`、`params` 兩個參數，工具說明會列出可用的啟動器、參數和可選值；
-- 啟動器有選項清單時，每個選項會變成一個 agent 類型 `herdr-commander:<啟動器>-<值>`；
-- 模型只能填參數值，而且必須符合檔案裡每個參數的 `pattern`；要執行什麼指令由檔案決定。這個資料夾的信任等級跟 settings 的 hooks 一樣，只讀使用者層，不讀專案層。
-
-格式、範例、除錯方式，以及「幫新插件接上 herdr」的步驟，都在 **[docs/launchers.md](docs/launchers.md)**。
-
 Claude worker 怎麼收到工作（0.3.0 起）：bridge 開的 Claude worker、由 Claude 派工者（有這個 mod 的 Claude session）派工時，任務和之後用 SendMessage 送來的訊息都走 **Claude Code 內建的跨 session 訊息**，不再打字進輸入框：
 - worker 的 mod 啟動時（以及 `/clear`、`/resume` 換對話後）把自己的 session id 交給 bridge，記在它的 worker 紀錄上。沒記到就每 5 秒再試，直到記到為止，最多試 5 分鐘；每次等 bridge 最多 30 秒。之後收到 prompt 時也會再試一次（0.3.2 起；之前只試一次、等 8 秒，機器一慢就永遠回報不了，見下面「送不到」）。派工者的 mod 在 Agent、`herdr_worker_spawn`、SendMessage 時帶上自己的 session id，記在 job 上（每次都更新，派工者換過對話也找得到）。
 - bridge 不打字，只把 job 標成「待寄」（`pending`），保存要寄的內容：訊息本身，不加任何標頭；第一份是任務加上還沒送的訊息。沒有長度限制，也不走任務檔（不經命令列）。
@@ -110,6 +100,16 @@ worker 中途用 SendMessage 傳給 main 的訊息照樣立刻轉給派工者（
 一個 worker 一次只做一個 job，其他 job 排隊；想平行就多開幾個 worker。
 
 Codex 端不變：Codex commander／worker 照舊用 `bridge/mcp.mjs` 的 MCP 工具（`herdr_job_complete`、結果檔帶 `job_id:` 檔頭）。排隊、重新打開 job 由 bridge 處理，Codex 一樣適用。
+
+### 啟動器：讓其他插件接上 herdr worker（0.4.0 起）
+
+插件想讓 worker 用自己的方式啟動 Claude 時（例如 SkillPool 的 `skillpool <profile>`），在 `%LOCALAPPDATA%\herdr-commander\launchers\` 放一個 JSON 檔，新開的 session（幾秒內）就能用，不用改 herdr-commander，插件也不用知道 herdr：
+
+- `herdr_worker_spawn` 多了 `launcher`、`params` 兩個參數，工具說明會列出可用的啟動器、參數和可選值；
+- 啟動器有選項清單時，每個選項會變成一個 agent 類型 `herdr-commander:<啟動器>-<值>`；
+- 模型只能填參數值，而且必須符合檔案裡每個參數的 `pattern`；要執行什麼指令由檔案決定。這個資料夾的信任等級跟 settings 的 hooks 一樣，只讀使用者層，不讀專案層。
+
+格式、範例、除錯方式，以及「幫新插件接上 herdr」的步驟，都在 **[docs/launchers.md](docs/launchers.md)**。
 
 ### 換對話（`/resume`、`/clear`）之後照樣在 herdr 裡（0.2.3 起）
 

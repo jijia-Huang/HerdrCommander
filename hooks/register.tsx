@@ -599,10 +599,10 @@ async function applyLaunchers($: EngineInterface, list: Launcher[]): Promise<voi
     if (launchTypeOf.has(spec.type)) {
       continue
     }
-    const added = await $.agent.register({ name: spec.name, description: spec.description, prompt: AGENT_SPECS[0].prompt }).then(() => true, () => false)
-    if (added) {
-      launchTypeOf.set(spec.type, spec)
-    }
+    // Routed whether or not this registration goes through: after a reload the
+    // name may be registered already, and the type must never run in-process.
+    launchTypeOf.set(spec.type, spec)
+    await $.agent.register({ name: spec.name, description: spec.description, prompt: AGENT_SPECS[0].prompt }).catch(() => null)
   }
   $.ui.invalidate('tool.describe')
 }
