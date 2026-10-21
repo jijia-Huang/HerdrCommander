@@ -433,19 +433,90 @@ export const TOOL_PREFIX = 'mcp__herdr-commander__'
 
 export const SPAWN_TOOL = {
   name: 'herdr_worker_spawn',
-  description: 'Open a herdr worker (claude or codex) in ANOTHER folder than this session\'s working directory, such as a different repository. For work in this session\'s own folder, use the Agent tool with subagent_type herdr-commander:claude-worker or herdr-commander:codex-worker instead; this tool refuses this session\'s own folder. The worker gets an id like Agent\'s: you are told when it finishes (a Claude worker\'s final reply comes as a cross-session message from it; for a Codex worker, the file to Read), SendMessage continues its job, it shows up in ListAgents, and TaskStop ends it.',
+  description: 'Open a herdr worker (claude or codex) in ANOTHER folder than this session\'s working directory, such as a different repository, or a Claude worker started by a launcher (any folder, this one included). For plain work in this session\'s own folder, use the Agent tool with subagent_type herdr-commander:claude-worker or herdr-commander:codex-worker instead; without a launcher this tool refuses this session\'s own folder. The worker gets an id like Agent\'s: you are told when it finishes (a Claude worker\'s final reply comes as a cross-session message from it; for a Codex worker, the file to Read), SendMessage continues its job, it shows up in ListAgents, and TaskStop ends it.',
   inputSchema: {
     type: 'object',
     properties: {
-      cwd: { type: 'string', description: 'the folder to work in (absolute path); not this session\'s own folder' },
-      kind: { type: 'string', enum: ['claude', 'codex'] },
+      cwd: { type: 'string', description: 'the folder to work in (absolute path); not this session\'s own folder unless a launcher is given' },
+      kind: { type: 'string', enum: ['claude', 'codex'], description: 'claude (the default) or codex; a launcher starts a claude worker' },
       task: { type: 'string', description: 'the first task' },
       name: { type: 'string', description: 'a name to address it by with SendMessage and TaskStop' },
+      launcher: { type: 'string', description: 'start the Claude worker by this launcher instead of plain claude (the launchers are listed in this tool\'s description)' },
+      params: { type: 'object', additionalProperties: { type: 'string' }, description: 'the launcher\'s parameter values, name: value' },
     },
-    required: ['cwd', 'kind', 'task'],
+    required: ['cwd', 'task'],
     additionalProperties: false,
   },
 } as const
+
+// Launchers (bridge/lib/launchers.mjs; docs/launchers.md) ----------------------------
+
+export type LauncherParam = {
+  pattern: string
+  required: boolean
+  description: string
+  default: string | null
+  choices: Array<{ value: string; description: string }> | null
+  choices_error?: string
+}
+
+export type Launcher = {
+  name: string
+  kind: 'claude'
+  description: string
+  params: Record<string, LauncherParam>
+  /** The parameter its agent types pick, one type per choice; null: no agent types. */
+  agent_param: string | null
+}
+
+/** An agent type a launcher's choice gives: started by `launcher` with `params`. */
+export type LaunchType = { name: string; type: string; description: string; launcher: string; params: Record<string, string> }
+
+const AGENT_NAME = /^[A-Za-z0-9_-]{1,64}$/
+
+/**
+ * One agent type per choice of a launcher's agent parameter, named
+ * `<launcher>-<value>` (the type is `herdr-commander:<launcher>-<value>`).
+ * The text says first that it is a pane of its own, a separate session: a
+ * plugin may define an in-process agent of the same name.
+ */
+export function launchTypes(launchers: readonly Launcher[]): LaunchType[] {
+  const out: LaunchType[] = []
+  for (const launcher of launchers) {
+    const param = launcher.agent_param
+    const choices = param ? launcher.params[param]?.choices ?? [] : []
+    for (const choice of choices) {
+      const name = `${launcher.name}-${choice.value}`
+      if (!param || !AGENT_NAME.test(name) || out.some(one => one.name === name)) {
+        continue
+      }
+      out.push({
+        name,
+        type: `herdr-commander:${name}`,
+        launcher: launcher.name,
+        params: { [param]: choice.value },
+        description: `[own herdr pane: launcher ${launcher.name}, ${param} ${choice.value}] ${choice.description || choice.value}. A Claude Code worker in its own visible herdr pane (a separate session with its own usage), in this session's folder, started by the "${launcher.name}" launcher: ${launcher.description}. Otherwise as herdr-commander:claude-worker: its final reply comes back as a cross-session message, SendMessage continues its job, TaskStop closes it.`,
+      })
+    }
+  }
+  return out
+}
+
+/** herdr_worker_spawn's description with the launchers there are (or the tool's own text when none). */
+export function spawnDescription(launchers: readonly Launcher[]): string {
+  if (launchers.length === 0) {
+    return SPAWN_TOOL.description
+  }
+  const lines = launchers.map(launcher => {
+    const params = Object.entries(launcher.params).map(([key, spec]) => {
+      const values = spec.choices?.length ? `; one of: ${spec.choices.map(one => one.value).join(', ')}` : ''
+      const optional = spec.required ? '' : spec.default !== null ? `, default ${spec.default}` : ', optional'
+      return `${key} (${spec.description || spec.pattern}${optional}${values})`
+    })
+    return `- ${launcher.name}: ${launcher.description}${params.length ? ` Params: ${params.join('; ')}.` : ''}`
+  })
+  return [SPAWN_TOOL.description, '', 'Launchers (launcher + params):', ...lines].join('\n')
+}
 
 export const SPAWN_ROLES: readonly Role[] = ['plain', 'commander']
 

@@ -924,3 +924,120 @@ test('a Claude worker starts in its sender\'s permission mode; an unknown mode i
   assert.equal(ops.claudeLine('C:\\Users\\me\\.claude\\plugins\\cache\\h\\h\\0.3.0', { model: 'sonnet', permissionMode: 'plan' }), 'claude --model sonnet --permission-mode plan')
   assert.equal(ops.claudeLine('C:\\Users\\me\\.claude\\plugins\\cache\\h\\h\\0.3.0', { permissionMode: 'yolo; rm' }), 'claude')
 })
+
+// Launchers (lib/launchers.mjs) ---------------------------------------------------
+
+const launchers = await import('../lib/launchers.mjs')
+
+/** Writes launcher files into a fresh registry folder for this test. */
+function registry(files) {
+  const folder = join(dir, 'launchers')
+  mkdirSync(folder, { recursive: true })
+  process.env.HERDR_BRIDGE_LAUNCHERS = folder
+  for (const [name, data] of Object.entries(files)) {
+    writeFileSync(join(folder, `${name}.json`), typeof data === 'string' ? data : JSON.stringify(data))
+  }
+  return folder
+}
+
+const PROFILE = { pattern: '^[a-z0-9][a-z0-9-]{0,40}$', description: 'profile name' }
+const POOL = { name: 'pool', description: 'Start under a profile', command: ['pool', '{profile}'], params: { profile: PROFILE } }
+
+test('a launcher file is checked: name = file name, anchored patterns, every placeholder a param, every param used', () => {
+  registry({
+    pool: POOL,
+    other: { ...POOL, name: 'pool' },
+    claude: { ...POOL, name: 'claude' },
+    loose: { ...POOL, name: 'loose', params: { profile: { pattern: '[a-z]+' } } },
+    stray: { ...POOL, name: 'stray', command: ['pool', '{profile}', '{model}'] },
+    unused: { ...POOL, name: 'unused', params: { profile: PROFILE, extra: PROFILE } },
+    quoted: { ...POOL, name: 'quoted', command: ['pool', 'say "hi"', '{profile}'] },
+    envy: { ...POOL, name: 'envy', env: { HERDR_PANE_ID: 'x' } },
+    broken: '{ not json',
+  })
+  const { launchers: good, errors } = launchers.loadLaunchers()
+  assert.deepEqual(good.map(one => one.name), ['pool'])
+  const why = Object.fromEntries(errors.map(one => [one.file.replace(/^.*[\\/]/, ''), one.error]))
+  assert.match(why['other.json'], /must be the file name/)
+  assert.match(why['claude.json'], /not be claude or codex/)
+  assert.match(why['loose.json'], /anchored/)
+  assert.match(why['stray.json'], /\{model\} is not one of its params/)
+  assert.match(why['unused.json'], /params\.extra is not used/)
+  assert.match(why['quoted.json'], /without double quotes/)
+  assert.match(why['envy.json'], /not starting with HERDR_/)
+  assert.ok(why['broken.json'])
+  assert.throws(() => launchers.getLauncher('broken'), /launcher broken is broken/)
+  assert.throws(() => launchers.getLauncher('nope'), /no launcher nope; known: pool/)
+})
+
+test('a launcher fills only values that pass the pattern; an optional param left out drops its tokens', () => {
+  registry({ pool: { ...POOL, command: ['pool', '{profile}', '--tag={tag}'], env: { POOL_TAG: '{tag}' }, params: { profile: PROFILE, tag: { pattern: '^[a-z]+$', required: false } } } })
+  const pool = launchers.getLauncher('pool')
+  assert.deepEqual(launchers.resolveLaunch(pool, { profile: 'h5-slot', tag: 'abc' }), { argv: ['pool', 'h5-slot', '--tag=abc'], env: { POOL_TAG: 'abc' }, params: { profile: 'h5-slot', tag: 'abc' } })
+  assert.deepEqual(launchers.resolveLaunch(pool, { profile: 'h5-slot' }), { argv: ['pool', 'h5-slot'], env: {}, params: { profile: 'h5-slot' } })
+  assert.throws(() => launchers.resolveLaunch(pool, { profile: 'x; rm -rf' }), /must match/)
+  assert.throws(() => launchers.resolveLaunch(pool, {}), /needs profile/)
+  assert.throws(() => launchers.resolveLaunch(pool, { profile: 'a', model: 'x' }), /has no parameter model/)
+})
+
+test('the typed line: plain tokens bare, others single-quoted, a quoted command run with &', () => {
+  assert.equal(launchers.launchLine(['skillpool', 'h5-slot'], ["--plugin-dir 'D:\\x'"]), "skillpool h5-slot --plugin-dir 'D:\\x'")
+  assert.equal(launchers.launchLine(['C:\\Program Files\\x\\a.exe', "it's", '--flag']), "& 'C:\\Program Files\\x\\a.exe' 'it''s' --flag")
+  assert.throws(() => launchers.launchLine(['a', 'b"c']), /cannot type/)
+})
+
+test('choices: a fixed list, or a command\'s JSON list read by field names; excluded and non-matching items dropped', async () => {
+  const script = join(dir, 'choices.mjs')
+  writeFileSync(script, `process.stdout.write(JSON.stringify([{ name: 'h5-slot', description: 'H5 遊戲', errors: [] }, { name: 'broken', description: 'x', errors: ['bad'] }, { name: 'Bad Name', description: 'y', errors: [] }]))`)
+  registry({
+    pool: { ...POOL, params: { profile: { ...PROFILE, choices: { command: ['node', script], value: 'name', description: 'description', exclude: 'errors' } } } },
+    fixed: { ...POOL, name: 'fixed', params: { profile: { ...PROFILE, choices: ['a', { value: 'b', description: 'Bee' }] } } },
+    failing: { ...POOL, name: 'failing', params: { profile: { ...PROFILE, choices: { command: ['node', join(dir, 'missing.mjs')] } } } },
+  })
+  const listed = await launchers.listLaunchers()
+  const byName = Object.fromEntries(listed.launchers.map(one => [one.name, one]))
+  assert.deepEqual(byName.pool.params.profile.choices, [{ value: 'h5-slot', description: 'H5 遊戲' }])
+  assert.equal(byName.pool.agent_param, 'profile')
+  assert.deepEqual(byName.fixed.params.profile.choices, [{ value: 'a', description: '' }, { value: 'b', description: 'Bee' }])
+  assert.equal(byName.failing.params.profile.choices, null)
+  assert.match(byName.failing.params.profile.choices_error, /choices command failed/)
+  assert.equal(byName.failing.agent_param, null)
+})
+
+test('a worker by a launcher: checked at worker-new, its pane runs the launcher\'s line with its env, the record names it', async () => {
+  registry({ pool: { ...POOL, env: { POOL_PROFILE: '{profile}' } } })
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  await assert.rejects(ops.workerNew(me, { cwd: dir, task: 'x', launcher: 'pool', params: { profile: 'Bad One' } }), /must match/)
+  await assert.rejects(ops.workerNew(me, { kind: 'codex', cwd: dir, task: 'x', launcher: 'pool', params: { profile: 'a' } }), /kind must be claude/)
+  const out = await ops.workerNew(me, { cwd: dir, task: 'build it', launcher: 'pool', params: { profile: 'h5-slot' }, model: 'sonnet' })
+  assert.deepEqual([out.worker.launcher, out.worker.launch_params], ['pool', { profile: 'h5-slot' }])
+  arrange({ agents: [...AGENTS, NINE], nextPane: 'wA:p9', spawnAgent: 'claude' })
+  await ops.workerStart(me, { herdr_id: out.worker.herdr_id })
+  const split = calls().find(args => args[0] === 'pane' && args[1] === 'split')
+  assert.ok(split.includes('POOL_PROFILE=h5-slot'))
+  const run = calls().find(args => args[0] === 'pane' && args[1] === 'run')
+  assert.equal(run[3], ops.claudeLine(undefined, { model: 'sonnet' }).replace(/^claude/, 'pool h5-slot'))
+  assert.match(readFileSync(out.worker.output_file, 'utf8'), /launcher pool \(profile=h5-slot\)/)
+})
+
+test('a launcher\'s worker that never comes up: the failure carries the pane\'s last lines', async () => {
+  registry({ pool: POOL })
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  const out = await ops.workerNew(me, { cwd: dir, task: 'build it', launcher: 'pool', params: { profile: 'nope' } })
+  arrange({ nextPane: 'wA:p9', spawnAgent: null, readText: 'pool: no profile "nope"\nPS D:\\x> \n' })
+  const started = await ops.workerStart(me, { herdr_id: out.worker.herdr_id })
+  assert.equal(started.worker.status, 'failed')
+  assert.match(started.worker.note, /started by launcher pool/)
+  assert.match(started.worker.note, /last lines:\npool: no profile "nope"/)
+})
+
+test('a launcher\'s worker with no session: the reason says the launcher may switch herdr-commander off', async () => {
+  registry({ pool: POOL })
+  new Store('wA').setLease({ pane_id: 'wA:p1', kind: 'claude' })
+  const out = await ops.workerNew(me, { cwd: dir, task: 'build it', launcher: 'pool', params: { profile: 'h5-slot' }, from_session: 'session-boss' })
+  arrange({ agents: [...AGENTS, NINE], nextPane: 'wA:p9', spawnAgent: 'claude' })
+  await ops.workerStart(me, { herdr_id: out.worker.herdr_id })
+  const store = new Store('wA')
+  store.putWorker({ ...store.getWorker(out.worker.herdr_id), running_at: new Date(Date.now() - 181000).toISOString() })
+  assert.match(ops.sendTake(me).failed[0].reason, /started by launcher pool, whose settings may switch herdr-commander off/)
+})

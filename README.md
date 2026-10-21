@@ -19,7 +19,7 @@ claude plugin install herdr-commander@herdr-commander
 
 裝好後所有 Claude session 都會載入它，但**不在 herdr 裡時完全不生效**（每個 hook 都先檢查 `HERDR_ENV`／`HERDR_PANE_ID`）。
 
-更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.3.2`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
+更新：版本號在 `.claude-plugin/plugin.json`（目前 `0.4.0`）。**只有改了版本號，`claude plugin update` 才會更新**；更新後在 session 內跑 `/reload-plugins`。
 
 ```powershell
 claude plugin update herdr-commander@herdr-commander
@@ -56,13 +56,23 @@ claude plugin update herdr-commander@herdr-commander
 
 | 原生工具 | 在 herdr 裡變成 |
 |---|---|
-| Agent，`subagent_type` 是 `herdr-commander:claude-worker` 或 `herdr-commander:codex-worker` | 在 commander 所在的資料夾旁開一個 herdr pane，裡面跑 Claude 或 Codex worker。立刻回「已在背景啟動」，id 是 `herdr-agent-<workspace>-<6 碼>`，outputFile 是 bridge 維護的 Markdown 紀錄（任務、雙方訊息、每次 Read 時的最新畫面）。**其他類型（Explore、general-purpose 等）、fork、remote 一律照原生，不開 pane（使用者已定）** |
+| Agent，`subagent_type` 是 `herdr-commander:claude-worker` 或 `herdr-commander:codex-worker` | 在 commander 所在的資料夾旁開一個 herdr pane，裡面跑 Claude 或 Codex worker。立刻回「已在背景啟動」，id 是 `herdr-agent-<workspace>-<6 碼>`，outputFile 是 bridge 維護的 Markdown 紀錄（任務、雙方訊息、每次 Read 時的最新畫面）。**其他類型（Explore、general-purpose 等）、fork、remote 一律照原生，不開 pane（使用者已定）**。啟動器的類型 `herdr-commander:<啟動器>-<值>` 也在這裡：開 Claude worker，但改用啟動器的指令啟動（0.4.0 起，見下面「啟動器」） |
 | SendMessage | worker 傳給 `main`（或派工者的 pane id／名字）：原樣立刻轉給派工者，當作中途報告（不算交件）；派工者是 Claude 時用跨 session 訊息寄過去。派工者傳給 worker（herdr id、名字、pane id）：併進進行中的 job；上一個 job 已完成就重新打開同一個 job；worker 正忙別人的 job 就排隊。目標是 bridge 開的 Claude worker 時當場用跨 session 訊息寄出，工具結果會說「已送達」「等 worker 起來再寄」或「送不到：原因」。不看訊息內容 |
 | TaskStop（herdr id，或自己開的 worker 的名字／pane id） | 送 Ctrl+C、關掉 pane，**不問人**；別人開的 pane 一律拒絕 |
 | ListAgents | 原生清單後面接著列：自己開的 herdr worker（id、名字、狀態、目前的 job、排隊數、資料夾、輸出檔），以及其他 herdr pane 的畫面檔路徑 |
 | Read 執行期資料夾裡的檔案 | 先由 bridge 刷新（worker 輸出檔補上最新畫面；`panes\<pane>.txt` 寫入該 pane 畫面），再交給原生 Read；這個資料夾的 Read 不跳權限詢問 |
 | 背景 Bash／PowerShell（`run_in_background`）、Monitor | **不接管，一律是 Claude 原生**（在 herdr 裡也一樣，使用者已定） |
-| `herdr_worker_spawn`（唯一保留的工具，commander／plain） | 在**別的**資料夾開 worker（`cwd`、`kind`、`task` 必填，`name` 選填）；給這個 session 自己的資料夾會被拒，請改用 Agent |
+| `herdr_worker_spawn`（唯一保留的工具，commander／plain） | 在**別的**資料夾開 worker（`cwd`、`task` 必填；`kind` 預設 claude，`name` 選填）；給這個 session 自己的資料夾會被拒，請改用 Agent。帶 `launcher`＋`params` 時用啟動器開 Claude worker，這時自己的資料夾也可以 |
+
+### 啟動器：讓其他插件接上 herdr worker（0.4.0 起）
+
+插件想讓 worker 用自己的方式啟動 Claude 時（例如 SkillPool 的 `skillpool <profile>`），在 `%LOCALAPPDATA%\herdr-commander\launchers\` 放一個 JSON 檔就好，不用改 herdr-commander，插件也不用知道 herdr：
+
+- `herdr_worker_spawn` 多了 `launcher`、`params` 兩個參數，工具說明會列出可用的啟動器、參數和可選值；
+- 啟動器有選項清單時，每個選項會變成一個 agent 類型 `herdr-commander:<啟動器>-<值>`；
+- 模型只能填參數值，而且必須符合檔案裡每個參數的 `pattern`；要執行什麼指令由檔案決定。這個資料夾的信任等級跟 settings 的 hooks 一樣，只讀使用者層，不讀專案層。
+
+格式、範例、除錯方式，以及「幫新插件接上 herdr」的步驟，都在 **[docs/launchers.md](docs/launchers.md)**。
 
 Claude worker 怎麼收到工作（0.3.0 起）：bridge 開的 Claude worker、由 Claude 派工者（有這個 mod 的 Claude session）派工時，任務和之後用 SendMessage 送來的訊息都走 **Claude Code 內建的跨 session 訊息**，不再打字進輸入框：
 - worker 的 mod 啟動時（以及 `/clear`、`/resume` 換對話後）把自己的 session id 交給 bridge，記在它的 worker 紀錄上。沒記到就每 5 秒再試，直到記到為止，最多試 5 分鐘；每次等 bridge 最多 30 秒。之後收到 prompt 時也會再試一次（0.3.2 起；之前只試一次、等 8 秒，機器一慢就永遠回報不了，見下面「送不到」）。派工者的 mod 在 Agent、`herdr_worker_spawn`、SendMessage 時帶上自己的 session id，記在 job 上（每次都更新，派工者換過對話也找得到）。
@@ -156,8 +166,8 @@ Claude 與 Codex 共用同一份 lease（`<runtime>/<workspace>/lease.json`）�
 ## 測試
 
 ```powershell
-cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 63 項，假 herdr，不碰實機
-cd ..; claude plugin validate .; claude plugin test .                            # 52 項；validate 也會檢查 marketplace.json
+cd D:\tool\HerdrCommander\bridge; node --test test/bridge.test.mjs   # 70 項，假 herdr，不碰實機
+cd ..; claude plugin validate .; claude plugin test .                            # 59 項；validate 也會檢查 marketplace.json
 ```
 
 在 herdr 的 worker pane 裡跑測試時，要先清掉 `HERDR_*` 環境變數（Git Bash：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_COMMANDER_ROLE ...`），否則 bridge 會把測試本身當成 worker，開 worker 的測試會失敗。

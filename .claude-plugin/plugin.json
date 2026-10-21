@@ -1,6 +1,6 @@
 {
   "name": "herdr-commander",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Inside herdr: Claude's own Agent (herdr worker types), SendMessage, TaskStop, ListAgents and Read go through herdr panes; commander pane, lifecycle, notifications via herdr-bridge. Outside herdr it does nothing",
   "author": { "name": "jijiahuang" },
   "types": "./types/index.d.ts",

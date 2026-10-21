@@ -7,6 +7,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, statSy
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { runJson, runText } from './herdr.mjs'
+import { getLauncher, launchLine, listLaunchers, resolveLaunch } from './launchers.mjs'
 import { BridgeError, CLI_PATH, CODEX_DIR, MCP_PATH, TOOL_ROOT, isInstalledCopy, runtimeRoot } from './paths.mjs'
 import { Store, newId } from './store.mjs'
 
@@ -537,7 +538,8 @@ export function sendTake(ctx) {
     if (!sessionId) {
       const since = Date.parse(worker?.running_at ?? '')
       if (worker?.status === 'running' && Date.now() - since > SESSION_WAIT_MS) {
-        const reason = `the Claude worker in pane ${worker.pane_id} has run for over ${SESSION_WAIT_MS / 1000} s without reporting its Claude session, so there is no session to send to (is herdr-commander loaded there, with takeover on?)`
+        const by = worker.launcher ? `; it was started by launcher ${worker.launcher}, whose settings may switch herdr-commander off` : ''
+        const reason = `the Claude worker in pane ${worker.pane_id} has run for over ${SESSION_WAIT_MS / 1000} s without reporting its Claude session, so there is no session to send to (is herdr-commander loaded there, with takeover on${by}?)`
         const marked = markUndeliverable(store, fresh, reason)
         failed.push({ job_id: marked.job_id, reason, event: `${marked.job_id}#${marked.seq}` })
       }
@@ -639,6 +641,17 @@ export function relayDone(ctx, { job_id: jobId, event_seq: eventSeq, delivered, 
  * in a new conversation after /clear or /resume): the address its work is
  * sent to. Recorded on the live herdr worker of this pane.
  */
+/** The launcher registry, each launcher's choices listed (their commands run). */
+export async function launchers() {
+  const out = await listLaunchers()
+  // The mod reads this at a session's start, before its own listing comes back
+  // (which runs the choices commands), so the first turn already has the types.
+  try {
+    writeFileSync(join(runtimeRoot(), 'launchers.json'), JSON.stringify(out), 'utf8')
+  } catch {}
+  return out
+}
+
 export function workerSession(ctx, { session_id: sessionId } = {}) {
   requireFrom(ctx)
   if (typeof sessionId !== 'string' || sessionId === '') {
@@ -1191,14 +1204,35 @@ export function newHerdrId(kind, workspace) {
  * the person's approval (they are when the modes differ).
  */
 export function claudeLine(root = TOOL_ROOT, { model, permissionMode } = {}) {
-  const parts = [isInstalledCopy(root) ? 'claude' : `claude --plugin-dir '${root}'`]
+  return ['claude', ...claudeArgs(root, { model, permissionMode })].join(' ')
+}
+
+/** What a Claude worker's line takes after `claude` (or after a launcher's command, which passes it on). */
+function claudeArgs(root, { model, permissionMode } = {}) {
+  const parts = isInstalledCopy(root) ? [] : [`--plugin-dir '${root}'`]
   if (model && /^[A-Za-z0-9._-]+$/.test(model)) {
     parts.push(`--model ${model}`)
   }
   if (PERMISSION_MODES.has(permissionMode)) {
     parts.push(`--permission-mode ${permissionMode}`)
   }
-  return parts.join(' ')
+  return parts
+}
+
+/**
+ * A worker's launcher and parameter values, checked now (so a bad value is
+ * refused before any pane opens): its record fields, or {} for plain `claude`.
+ */
+function launchFields(kind, launcherName, values) {
+  if (launcherName === undefined || launcherName === null || launcherName === '') {
+    return {}
+  }
+  if (kind !== 'claude') {
+    throw new BridgeError('bad_launcher', 'a launcher starts a Claude worker; kind must be claude')
+  }
+  const launcher = getLauncher(String(launcherName))
+  const { params } = resolveLaunch(launcher, values ?? {})
+  return { launcher: launcher.name, launch_params: params }
 }
 
 /** Workers never start panes; a plain pane may while no other live pane holds the commander lease. */
@@ -1218,13 +1252,14 @@ async function requireMayStart(ctx) {
 }
 
 /** Splits a pane beside the caller and starts the agent there; waits until herdr sees it settle. */
-async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, model, permissionMode, herdrId }) {
+async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, model, permissionMode, herdrId, launch = null }) {
   const split = await runJson([
     'pane', 'split', '--pane', ctx.from,
     '--direction', direction === 'down' ? 'down' : 'right',
     '--cwd', cwd,
     '--env', 'HERDR_COMMANDER_ROLE=worker',
     '--env', `HERDR_COMMANDER_PARENT=${ctx.from}`,
+    ...Object.entries(launch?.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
     '--no-focus',
   ])
   const paneId = split?.pane?.pane_id
@@ -1240,9 +1275,10 @@ async function openWorkerPane(ctx, ws, { kind, cwd, direction = 'right', name, m
     store.putWorker({ ...store.getWorker(herdrId), pane_id: paneId, agent_name: agentName })
   }
   // The pane shell is PowerShell 5.1, which mangles embedded quotes in native
-  // arguments; so the command line typed there carries no quoted payload.
+  // arguments; so the command line typed there carries no quoted payload. A
+  // launcher's command stands for `claude` and passes the rest on to it.
   const line = kind === 'claude'
-    ? claudeLine(TOOL_ROOT, { model, permissionMode })
+    ? (launch ? launchLine(launch.argv, claudeArgs(TOOL_ROOT, { model, permissionMode })) : claudeLine(TOOL_ROOT, { model, permissionMode }))
     : `& '${process.execPath}' '${CLI_PATH}' codex-launch b64:${Buffer.from(JSON.stringify({ role: 'worker', pane: paneId, workspace: ws })).toString('base64')}`
   await runJson(['pane', 'run', paneId, line])
   const detected = await waitForAgent(paneId, kind, Number(process.env.HERDR_BRIDGE_START_MS ?? 90000))
@@ -1294,9 +1330,10 @@ function samePath(a, b) {
  * `forbid_cwd`: refuse that folder (herdr_worker_spawn is for other folders).
  * `from_session`: the caller's Claude session (its mod's), so a Claude worker's
  * messages go by Claude's cross-session messages; `permission_mode`: the
- * caller's mode, which a Claude worker starts in.
+ * caller's mode, which a Claude worker starts in. `launcher`, `params`: start
+ * the worker by that launcher instead of plain `claude` (launchers.mjs).
  */
-export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, subagent_type: subagentType, description, forbid_cwd: forbidCwd, from_session: fromSession, permission_mode: permissionMode }) {
+export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, subagent_type: subagentType, description, forbid_cwd: forbidCwd, from_session: fromSession, permission_mode: permissionMode, launcher, params }) {
   const ws = await requireMayStart(ctx)
   if (!['claude', 'codex'].includes(kind)) {
     throw new BridgeError('bad_kind', 'kind must be claude or codex')
@@ -1315,6 +1352,7 @@ export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, 
   if (forbidCwd && samePath(dir, forbidCwd)) {
     throw new BridgeError('same_folder', 'that is this session\'s own folder: use the Agent tool with subagent_type herdr-commander:claude-worker or herdr-commander:codex-worker instead')
   }
+  const launch = launchFields(kind, launcher, params)
   const store = storeFor(ws)
   const herdrId = newHerdrId('agent', ws)
   const worker = {
@@ -1330,6 +1368,7 @@ export async function workerNew(ctx, { kind = 'claude', name, cwd, task, model, 
     model: model ?? null,
     permission_mode: PERMISSION_MODES.has(permissionMode) ? permissionMode : null,
     cwd: dir,
+    ...launch,
     output_file: store.outputPath(herdrId),
     status: 'starting',
     created_at: now(),
@@ -1365,14 +1404,19 @@ export async function workerStart(ctx, { herdr_id: herdrId }) {
   }
   let opened
   try {
-    opened = await openWorkerPane(ctx, ws, { kind: worker.worker_kind, cwd: worker.cwd, name: worker.name ?? worker.description ?? undefined, model: worker.model ?? undefined, permissionMode: worker.permission_mode ?? undefined, herdrId: worker.herdr_id })
+    // The launcher file is read again here: it may have changed since worker-new.
+    const launch = worker.launcher ? resolveLaunch(getLauncher(worker.launcher), worker.launch_params ?? {}) : null
+    opened = await openWorkerPane(ctx, ws, { kind: worker.worker_kind, cwd: worker.cwd, name: worker.name ?? worker.description ?? undefined, model: worker.model ?? undefined, permissionMode: worker.permission_mode ?? undefined, herdrId: worker.herdr_id, launch })
   } catch (error) {
     return failWith('failed', 'start_failed', `${error.code ?? 'error'}: ${error.message ?? error}`)
   }
   const { paneId, agentName, detected } = opened
   store.putWorker({ ...store.getWorker(worker.herdr_id), pane_id: paneId, agent_name: agentName })
   if (!detected) {
-    return failWith('failed', 'start_failed', `no ${worker.worker_kind} agent detected in ${paneId} within 90s (check the pane for a trust or login prompt)`)
+    // What the pane shows says why (a launcher that exited with an error, a prompt).
+    const tail = await runText(['pane', 'read', paneId, '--source', 'recent-unwrapped', '--lines', '15']).then(text => text.replace(/\s+$/, '')).catch(() => '')
+    const by = worker.launcher ? ` (started by launcher ${worker.launcher})` : ''
+    return failWith('failed', 'start_failed', `no ${worker.worker_kind} agent detected in ${paneId}${by} within 90s (check the pane for a trust or login prompt)${tail ? `; the pane's last lines:\n${tail}` : ''}`)
   }
   if (detected.agent_status === 'blocked') {
     return failWith('blocked', 'start_blocked', `${paneId} is waiting on a prompt (folder trust, login, ...); the person must answer it in that pane. The task goes out once the worker is idle.`)
@@ -1498,7 +1542,7 @@ function writeWorkerOutput(herdrId, screen = null) {
   const lines = [
     `# herdr worker ${worker.herdr_id}`,
     '',
-    `${worker.worker_kind} worker${worker.name ? ` "${worker.name}"` : ''} · status ${worker.status} · pane ${worker.pane_id ?? '(starting)'} · folder ${worker.cwd} · started by ${worker.owner}`,
+    `${worker.worker_kind} worker${worker.name ? ` "${worker.name}"` : ''}${worker.launcher ? ` · launcher ${worker.launcher}${Object.keys(worker.launch_params ?? {}).length ? ` (${Object.entries(worker.launch_params).map(([key, value]) => `${key}=${value}`).join(', ')})` : ''}` : ''} · status ${worker.status} · pane ${worker.pane_id ?? '(starting)'} · folder ${worker.cwd} · started by ${worker.owner}`,
     worker.note ? `Note: ${worker.note}` : '',
     'Read this file again for the latest; it is rewritten on every message and on every Read.',
   ]

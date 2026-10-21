@@ -21,6 +21,18 @@ export function runtimeRoot() {
 }
 
 /**
+ * The launcher registry: %LOCALAPPDATA%\herdr-commander\launchers, one JSON
+ * file per launcher (docs/launchers.md); HERDR_BRIDGE_LAUNCHERS overrides it
+ * (tests). User level only: a project folder never adds launchers.
+ */
+export function launchersDir() {
+  if (process.env.HERDR_BRIDGE_LAUNCHERS) {
+    return process.env.HERDR_BRIDGE_LAUNCHERS
+  }
+  return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'herdr-commander', 'launchers')
+}
+
+/**
  * True when this copy is the one Claude Code installed (in its plugin cache):
  * a plain `claude` then loads it, while a working copy is passed by --plugin-dir.
  */

@@ -35,6 +35,7 @@ import {
   herdrKind,
   herdrListing,
   isRuntimePath,
+  launchTypes,
   noticeText,
   notices,
   parseReply,
@@ -42,12 +43,13 @@ import {
   runtimeRootOf,
   sentText,
   sortAgents,
+  spawnDescription,
   toJobs,
   toRows,
   toWorkers,
   transitions,
 } from './pure'
-import type { Delivery, Options, RawAgent, RawJob, RawWorker, RelayNotice, RouteReply, Snapshot } from './pure'
+import type { Delivery, LaunchType, Launcher, Options, RawAgent, RawJob, RawWorker, RelayNotice, RouteReply, Snapshot } from './pure'
 
 // State ($.state). Atoms are declared here: the engine reads them per file.
 
@@ -135,6 +137,10 @@ let turnRunning = false
 const heldNotices: string[] = []
 let runtimeRoot = ''
 let options: Options = readOptions({})
+/** The launcher registry as the bridge last listed it (herdr_worker_spawn's description). */
+let launchers: Launcher[] = []
+/** Agent types the launchers' choices give, by type (`herdr-commander:<launcher>-<value>`). */
+const launchTypeOf = new Map<string, LaunchType>()
 
 /** Runs a bridge command; `stdinArgs` go on stdin (no command-line length limit). */
 async function bridge<T = unknown>($: EngineInterface, command: string, args: Record<string, unknown> = {}, byUser = false, timeoutMs = 30000, stdinArgs: Record<string, unknown> | null = null): Promise<T> {
@@ -561,6 +567,46 @@ async function refreshPreview($: EngineInterface): Promise<void> {
   }
 }
 
+/**
+ * Reads the launcher registry (the bridge runs each launcher's choices
+ * command) and registers an agent type per choice; herdr_worker_spawn's
+ * description lists the launchers. In the background: a choices command may
+ * take a while, and without it the plain worker types still work.
+ */
+async function loadLaunchers($: EngineInterface): Promise<void> {
+  const out = await bridge<{ launchers: Launcher[] }>($, 'launchers', {}, false, 60000).catch(() => null)
+  if (out) {
+    await applyLaunchers($, out.launchers ?? [])
+  }
+}
+
+/**
+ * The bridge's last listing (it keeps one in the runtime folder): read at a
+ * session's start, so its first turn has the types; loadLaunchers follows.
+ */
+async function cachedLaunchers($: EngineInterface): Promise<void> {
+  try {
+    const out = JSON.parse(String(await $.fs.read(`${runtimeRoot}/launchers.json`))) as { launchers?: Launcher[] }
+    await applyLaunchers($, out.launchers ?? [])
+  } catch {
+    // none yet, or unreadable: loadLaunchers brings them
+  }
+}
+
+async function applyLaunchers($: EngineInterface, list: Launcher[]): Promise<void> {
+  launchers = list
+  for (const spec of launchTypes(launchers)) {
+    if (launchTypeOf.has(spec.type)) {
+      continue
+    }
+    const added = await $.agent.register({ name: spec.name, description: spec.description, prompt: AGENT_SPECS[0].prompt }).then(() => true, () => false)
+    if (added) {
+      launchTypeOf.set(spec.type, spec)
+    }
+  }
+  $.ui.invalidate('tool.describe')
+}
+
 async function registerSpawnTool($: EngineInterface, role: Role): Promise<void> {
   if (options.takeover && SPAWN_ROLES.includes(role) && !toolRegistered) {
     await $.tool.register({ name: SPAWN_TOOL.name, description: SPAWN_TOOL.description, inputSchema: SPAWN_TOOL.inputSchema })
@@ -635,6 +681,8 @@ async function choose($: EngineInterface, paneId: string): Promise<void> {
 export const register: Register = (on, rawOptions) => {
   options = readOptions(rawOptions)
   toolRegistered = false
+  launchers = []
+  launchTypeOf.clear()
   briefedRole = null
 
   // The one tool: a herdr worker in another folder ---------------------------------
@@ -646,14 +694,18 @@ export const register: Register = (on, rawOptions) => {
       return { deny: `herdr_worker_spawn: ${why}` }
     }
     const args = e as unknown as Record<string, unknown>
+    const launcher = typeof args.launcher === 'string' && args.launcher !== '' ? args.launcher : undefined
     try {
       const out = await bridge<NewWorker>($, 'worker-new', {
-        kind: args.kind,
+        kind: args.kind ?? 'claude',
         cwd: args.cwd,
         task: args.task,
         name: args.name,
         description: typeof args.name === 'string' ? args.name : undefined,
-        forbid_cwd: await $.session.cwd(),
+        launcher,
+        params: launcher ? args.params : undefined,
+        // A launcher's worker is a different setup, so this session's own folder is fine for it.
+        forbid_cwd: launcher ? undefined : await $.session.cwd(),
         from_session: await $.session.id(),
         permission_mode: permissionMode ?? undefined,
       })
@@ -664,6 +716,12 @@ export const register: Register = (on, rawOptions) => {
     } catch (error) {
       return { deny: errorText(error) }
     }
+  })
+
+  // Its description lists the launchers (loadLaunchers; asked again after it).
+  on('tool.describe', { tool: /^mcp__herdr-commander__herdr_worker_spawn$/ }, async ($, e, next) => {
+    const base = await next(e)
+    return launchers.length === 0 ? base : { ...base, description: spawnDescription(launchers) }
   })
 
   // Session start: the gate ------------------------------------------------------------
@@ -690,6 +748,8 @@ export const register: Register = (on, rawOptions) => {
       for (const spec of AGENT_SPECS) {
         await $.agent.register({ name: spec.name, description: spec.description, prompt: spec.prompt }).catch(() => null)
       }
+      await cachedLaunchers($)
+      later($, () => loadLaunchers($))
     }
     if (role !== 'worker') {
       await $.command.register({ name: 'commander', description: "herdr: become this workspace's commander and open the Commander pane (/commander off to stop)" })
@@ -872,7 +932,8 @@ export const register: Register = (on, rawOptions) => {
     // Agent with a herdr worker type: a worker pane under a herdr id. Those
     // types never run in-process: when herdr cannot take them, the call is refused.
     on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-      const kind = herdrKind(e.subagent_type)
+      const launch = launchTypeOf.get(e.subagent_type ?? '')
+      const kind = launch ? 'claude' : herdrKind(e.subagent_type)
       const g = await gateOf($)
       if (!kind || !g.inHerdr) {
         return next(e)
@@ -890,6 +951,8 @@ export const register: Register = (on, rawOptions) => {
           model: e.model,
           subagent_type: e.subagent_type,
           description: e.description,
+          launcher: launch?.launcher,
+          params: launch?.params,
           // This session is where a Claude worker's messages come back (and its
           // mode the one the worker starts in, so those are not held for approval).
           from_session: await $.session.id(),

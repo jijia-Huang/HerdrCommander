@@ -24,6 +24,7 @@ export const COMMANDS = {
   'worker-session': { run: ops.workerSession },
   'peer-message': { run: ops.peerMessage },
   'worker-new': { run: ops.workerNew },
+  launchers: { run: ops.launchers },
   'worker-start': { run: ops.workerStart },
   stop: { run: ops.stop },
   refresh: { run: ops.refresh },

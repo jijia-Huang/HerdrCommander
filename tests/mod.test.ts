@@ -857,3 +857,107 @@ describe('pure helpers', () => {
     expect(herdrListing([], [], 'C:/rt/wA/panes')).toBe('herdr: no other agents in this herdr session.')
   })
 })
+
+/** A launcher as the bridge lists it: SkillPool's, with two profiles to pick from. */
+const SKILLPOOL = {
+  name: 'skillpool',
+  kind: 'claude',
+  description: 'Start the worker under a SkillPool profile',
+  params: {
+    profile: {
+      pattern: '^[a-z0-9][a-z0-9-]{0,40}$',
+      required: true,
+      description: 'SkillPool profile name',
+      default: null,
+      choices: [{ value: 'h5-slot', description: 'H5 Slot games' }, { value: 'inanna-slot', description: 'Inanna Lua games' }],
+    },
+  },
+  agent_param: 'profile',
+}
+
+describe('launchers', () => {
+  test('a plain pane lists the launchers in the background and gets an agent type per choice', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const clock = mock.clock(on)
+    world.replies.launchers = { launchers: [SKILLPOOL], errors: [] }
+    await $.session.start(SESSION)
+    expect(world.agentTypes).toEqual(['claude-worker', 'codex-worker'])
+    await clock.advance(10)
+    expect(world.bridge.filter(call => call.command === 'launchers')).toHaveLength(1)
+    expect(world.agentTypes).toEqual(['claude-worker', 'codex-worker', 'skillpool-h5-slot', 'skillpool-inanna-slot'])
+  })
+
+  test('the bridge\'s last listing is read at the start, so the types are there before the background listing', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    mock.clock(on)
+    const read: string[] = []
+    on('fs.read', ($, e) => {
+      read.push(String(e.path))
+      return { value: JSON.stringify({ launchers: [SKILLPOOL], errors: [] }) } as never
+    })
+    await $.session.start(SESSION)
+    expect(read.map(path => path.replace(/\\/g, '/'))).toEqual(['C:/rt/launchers.json'])
+    expect(world.agentTypes).toEqual(['claude-worker', 'codex-worker', 'skillpool-h5-slot', 'skillpool-inanna-slot'])
+    expect(world.bridge.some(call => call.command === 'launchers')).toBe(false)
+  })
+
+  test('Agent with a launcher\'s type starts a Claude worker by that launcher, in this folder', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const clock = mock.clock(on)
+    world.replies.launchers = { launchers: [SKILLPOOL], errors: [] }
+    world.replies['worker-new'] = NEW_WORKER
+    on('tool.call', () => NATIVE as never)
+    await $.session.start(SESSION)
+    await clock.advance(10)
+    const ran = await $.tool.call({ ...CALLS.agent, subagent_type: 'herdr-commander:skillpool-h5-slot' } as never)
+    expect((ran.result as { status: string }).status).toBe('async_launched')
+    expect(world.bridge.find(call => call.command === 'worker-new')?.args).toMatchObject({ kind: 'claude', cwd: 'D:\\work', launcher: 'skillpool', params: { profile: 'h5-slot' }, subagent_type: 'herdr-commander:skillpool-h5-slot' })
+    // Another plugin's type of a similar name stays native.
+    const native = await $.tool.call({ ...CALLS.agent, subagent_type: 'skillpool-h5-slot' } as never)
+    expect(native.result).toBe('native')
+  })
+
+  test('herdr_worker_spawn takes a launcher and its params, and then this folder is not refused', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    mock.clock(on)
+    world.replies['worker-new'] = NEW_WORKER
+    await $.session.start(SESSION)
+    await $.tool.call({ tool: 'mcp__herdr-commander__herdr_worker_spawn', cwd: 'D:\\work', task: 'build it', launcher: 'skillpool', params: { profile: 'h5-slot' } } as never)
+    const args = world.bridge.find(call => call.command === 'worker-new')?.args
+    expect(args).toMatchObject({ kind: 'claude', cwd: 'D:\\work', launcher: 'skillpool', params: { profile: 'h5-slot' } })
+    expect(args?.forbid_cwd).toBeUndefined()
+    world.failures['worker-new'] = { code: 'bad_params', message: 'profile for launcher skillpool must match ^[a-z0-9][a-z0-9-]{0,40}$' }
+    const refused = await $.tool.call({ tool: 'mcp__herdr-commander__herdr_worker_spawn', cwd: 'D:\\work', task: 'x', launcher: 'skillpool', params: { profile: 'x; rm' } } as never)
+    expect(refused.deny).toContain('bad_params')
+  })
+
+  test('herdr_worker_spawn\'s description lists the launchers once they are read', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const clock = mock.clock(on)
+    on('tool.describe', ($, e) => ({ description: e.description }))
+    world.replies.launchers = { launchers: [SKILLPOOL], errors: [] }
+    await $.session.start(SESSION)
+    const input = { tool: 'mcp__herdr-commander__herdr_worker_spawn', description: 'base text', provider: { plugin: 'herdr-commander', tier: 'user' } } as never
+    await clock.advance(10)
+    const described = await $.tool.describe(input)
+    expect(described.description).toContain('Launchers (launcher + params):')
+    expect(described.description).toContain('- skillpool: Start the worker under a SkillPool profile Params: profile (SkillPool profile name; one of: h5-slot, inanna-slot).')
+  })
+
+  test('a worker pane does not read the launchers', async ($, on) => {
+    const world = worldOf(on, { ...HERDR_ENV, HERDR_COMMANDER_ROLE: 'worker' })
+    const clock = mock.clock(on)
+    await $.session.start(SESSION)
+    await clock.advance(10)
+    expect(world.bridge.some(call => call.command === 'launchers')).toBe(false)
+  })
+
+  test('a failed listing leaves the plain worker types', async ($, on) => {
+    const world = worldOf(on, HERDR_ENV)
+    const clock = mock.clock(on)
+    world.failures.launchers = { code: 'error', message: 'boom' }
+    await $.session.start(SESSION)
+    await clock.advance(10)
+    expect(world.agentTypes).toEqual(['claude-worker', 'codex-worker'])
+  })
+})
