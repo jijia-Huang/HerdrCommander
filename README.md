@@ -44,7 +44,7 @@ claude plugin update herdr-commander@herdr-commander
 
 ### Claude 當 commander
 
-在 herdr 的 pane 裡啟動 `claude`（裝好 plugin 後直接啟動；開發時用 `claude --plugin-dir 'D:\tool\HerdrCommander'`），然後輸入 `/commander`。會取得這個 workspace 的 commander lease、打開 Commander 面板，並擋掉自己的 Write／Edit／NotebookEdit。`/commander off` 結束。
+在 herdr 的 pane 裡啟動 `claude`（裝好 plugin 後直接啟動；開發時用 `claude --plugin-dir 'D:\tool\HerdrCommander'`），然後輸入 `/commander`。會取得這個 workspace 的 commander lease、打開 Commander 面板，並擋掉自己的 Write／Edit／NotebookEdit。`/commander off` 結束。記憶檔例外：`~/.claude/` 底下、放在 `memory` 資料夾裡的檔案（原生記憶 `projects/<x>/memory/`，或 SkillPool 這類啟動器的 profile 記憶 `profiles/<p>/memory/<專案>/`），commander 可以自己寫；旁邊有 `memory/` 資料夾的 CLAUDE.md（例如 profile 的 CLAUDE.md）也可以用 Edit 改，但不能用 Write 整檔覆蓋。`~/.claude/CLAUDE.md` 不在例外範圍內。那些檔案本身有的其他規則照樣生效（例如 SkillPool 的 mod 只讓「## 跨專案記憶」那段被改）。
 
 面板內容：各 agent 的狀態燈號、kind、持續時間、title（依 workspace 分組，blocked 排最前）、選中 agent 的最近輸出、自己派出去的 jobs。
 

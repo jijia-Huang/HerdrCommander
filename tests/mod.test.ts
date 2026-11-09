@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { awaitingRelay, base64, herdrListing, isRuntimePath, notices, readOptions, toRows, transitions } from '../hooks/pure'
+import { awaitingRelay, base64, herdrListing, isMemoryPath, isRuntimePath, memoryBesideClaudeMd, notices, readOptions, toRows, transitions } from '../hooks/pure'
 import type { RawAgent } from '../hooks/pure'
 import type { JobRow, WorkerRow } from '../types'
 import { AGENTS, HERDR_ENV, PANE, SESSION, command, conversations, fromBase64, textOf, worldOf } from './world'
@@ -117,8 +117,15 @@ describe('inside herdr', () => {
     })
   }
 
-  test('/commander claims the lease, opens the pane, adds the role section and blocks edits; off undoes it', async ($, on) => {
-    const world = worldOf(on, HERDR_ENV)
+  test('/commander claims the lease, opens the pane, adds the role section and blocks edits but memory; off undoes it', async ($, on) => {
+    const world = worldOf(on, { ...HERDR_ENV, USERPROFILE: 'C:\\Users\\me' })
+    let profileMemory = false // the memory folder beside the profile's CLAUDE.md
+    on('fs.stat', ($, e) => {
+      if (!profileMemory || String(e.path).replace(/\\/g, '/').toLowerCase() !== 'c:/users/me/.claude/skillpool/profiles/h5-slot/memory') {
+        throw new Error('ENOENT')
+      }
+      return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } as never
+    })
     const clock = mock.clock(on)
     on('prompt.compose', () => COMPOSED)
     on('tool.call', () => NATIVE as never)
@@ -133,6 +140,16 @@ describe('inside herdr', () => {
     expect(sections[2]?.text).not.toMatch(/herdr_message_send|herdr_job_get|herdr_agent_read|herdr_agents_list/)
     const denied = await $.tool.call({ tool: 'Edit', file_path: 'D:\\work\\a.txt', old_string: 'a', new_string: 'b' } as never)
     expect(denied.deny).toContain('commander does not edit files')
+    const memory = 'C:\\Users\\me\\.claude\\skillpool\\profiles\\h5-slot\\memory\\D--work\\MEMORY.md'
+    expect((await $.tool.call({ tool: 'Write', file_path: memory, content: '- x' } as never)).deny).toBeUndefined()
+    expect((await $.tool.call({ tool: 'Edit', file_path: 'C:/Users/me/.claude/projects/D--work/memory/x.md', old_string: 'a', new_string: 'b' } as never)).deny).toBeUndefined()
+    const profileClaudeMd = 'C:\\Users\\me\\.claude\\skillpool\\profiles\\h5-slot\\CLAUDE.md'
+    expect((await $.tool.call({ tool: 'Edit', file_path: profileClaudeMd, old_string: 'a', new_string: 'b' } as never)).deny).toContain('commander does not edit files')
+    profileMemory = true
+    expect((await $.tool.call({ tool: 'Edit', file_path: profileClaudeMd, old_string: 'a', new_string: 'b' } as never)).deny).toBeUndefined()
+    expect((await $.tool.call({ tool: 'Write', file_path: profileClaudeMd, content: 'x' } as never)).deny).toContain('commander does not edit files')
+    expect((await $.tool.call({ tool: 'Edit', file_path: 'C:\\Users\\me\\.claude\\CLAUDE.md', old_string: 'a', new_string: 'b' } as never)).deny).toContain('commander does not edit files')
+    expect((await $.tool.call({ tool: 'Edit', file_path: 'C:\\Users\\me\\.claude\\skillpool\\profiles\\cc-front\\CLAUDE.md', old_string: 'a', new_string: 'b' } as never)).deny).toContain('commander does not edit files')
 
     await clock.advance(5000)
     const off = await $.command.run(command('commander', 'off'))
@@ -793,7 +810,19 @@ describe('pure helpers', () => {
   })
 
   test('runtime paths: inside the runtime folder only, any case or slash, no escape', () => {
-    expect(isRuntimePath('C:\\Users\\me\\AppData\\Local\\herdr-commander\\runtime\\wA\\out\\x.md', 'C:/Users/me/AppData/Local/herdr-commander/runtime')).toBe(true)
+    expect(isMemoryPath('C:\\Users\\me\\.claude\\skillpool\\profiles\\h5-slot\\memory\\D--H5\\MEMORY.md', 'C:\\Users\\me')).toBe(true)
+    expect(isMemoryPath('c:/users/me/.claude/projects/D--work/memory/a.md', 'C:/Users/me/')).toBe(true)
+    expect(isMemoryPath('C:/Users/me/.claude/projects/D--work/memory/../../settings.json', 'C:/Users/me')).toBe(false)
+    expect(isMemoryPath('C:/Users/me/.claude/memory', 'C:/Users/me')).toBe(false) // a file named memory, not a folder
+    expect(isMemoryPath('C:/Users/me/.claude/settings.json', 'C:/Users/me')).toBe(false)
+    expect(isMemoryPath('D:/work/memory/a.md', 'C:/Users/me')).toBe(false)
+    expect(isMemoryPath('C:/Users/me/.claude/projects/x/memory/a.md', '')).toBe(false)
+    expect(memoryBesideClaudeMd('C:\\Users\\me\\.claude\\skillpool\\profiles\\h5-slot\\CLAUDE.md', 'C:\\Users\\me')).toBe('c:/users/me/.claude/skillpool/profiles/h5-slot/memory')
+    expect(memoryBesideClaudeMd('C:/Users/me/.claude/CLAUDE.md', 'C:/Users/me')).toBeNull()
+    expect(memoryBesideClaudeMd('D:/work/CLAUDE.md', 'C:/Users/me')).toBeNull()
+    expect(memoryBesideClaudeMd('C:/Users/me/.claude/x/../CLAUDE.md', 'C:/Users/me')).toBeNull()
+    expect(memoryBesideClaudeMd('C:/Users/me/.claude/skillpool/profiles/a/notes.md', 'C:/Users/me')).toBeNull()
+    expect(isRuntimePath('C:\\Users\\me\\AppData\\Local\\herdr-commander\\runtime\\wA\\out\\x.md','C:/Users/me/AppData/Local/herdr-commander/runtime')).toBe(true)
     expect(isRuntimePath('c:/users/me/appdata/local/herdr-commander/runtime/wA/x', 'C:\\Users\\me\\AppData\\Local\\herdr-commander\\runtime\\')).toBe(true)
     expect(isRuntimePath('C:/Users/me/AppData/Local/herdr-commander/runtime-other/x', 'C:/Users/me/AppData/Local/herdr-commander/runtime')).toBe(false)
     expect(isRuntimePath('C:/Users/me/AppData/Local/herdr-commander/runtime/../../x', 'C:/Users/me/AppData/Local/herdr-commander/runtime')).toBe(false)

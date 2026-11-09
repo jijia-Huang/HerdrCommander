@@ -34,7 +34,9 @@ import {
   eventText,
   herdrKind,
   herdrListing,
+  isMemoryPath,
   isRuntimePath,
+  memoryBesideClaudeMd,
   launchTypes,
   noticeText,
   notices,
@@ -635,7 +637,7 @@ async function enterCommander($: EngineInterface): Promise<string> {
   await $.ui.open({ id: PANE_ID_UI, title: 'Commander' })
   startPreview($)
   await ensurePolling($)
-  return 'Commander on: the Commander pane lists the herdr agents. Write/Edit/NotebookEdit are blocked in this role; /commander off ends it.'
+  return 'Commander on: the Commander pane lists the herdr agents. Write/Edit/NotebookEdit are blocked in this role, except on its memory under ~/.claude/; /commander off ends it.'
 }
 
 async function leaveCommander($: EngineInterface): Promise<string> {
@@ -899,7 +901,15 @@ export const register: Register = (on, rawOptions) => {
     }
     const tool = String(e.tool)
     if (g.role === 'commander' && (WRITE_TOOLS as readonly string[]).includes(tool)) {
-      return { deny: 'herdr-commander: the commander does not edit files; give the change to a worker (Agent with subagent_type herdr-commander:claude-worker, or SendMessage to an existing one) or run /commander off.' }
+      const input = e as unknown as { file_path?: unknown; notebook_path?: unknown }
+      const file = typeof input.file_path === 'string' ? input.file_path
+        : typeof input.notebook_path === 'string' ? input.notebook_path : ''
+      const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+      const beside = tool === 'Edit' ? memoryBesideClaudeMd(file, home) : null
+      const profileClaudeMd = beside !== null && (await $.fs.stat(beside).catch(() => null))?.kind === 'dir'
+      if (!isMemoryPath(file, home) && !profileClaudeMd) {
+        return { deny: 'herdr-commander: the commander does not edit files (its memory under ~/.claude/ excepted: memory folders, and Edit of a CLAUDE.md that has a memory folder beside it); give the change to a worker (Agent with subagent_type herdr-commander:claude-worker, or SendMessage to an existing one) or run /commander off.' }
+      }
     }
     const isDialog = options.lifecycleReport && (DIALOG_TOOLS as readonly string[]).includes(tool)
     if (isDialog) {

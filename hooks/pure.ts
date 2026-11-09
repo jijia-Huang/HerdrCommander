@@ -117,6 +117,40 @@ export function isRuntimePath(path: string, root: string): boolean {
   return full.startsWith(`${canonical(root)}/`)
 }
 
+/**
+ * True for a memory file the commander may still write: under `<home>/.claude/`,
+ * inside a folder named `memory` (Claude Code's `projects/<x>/memory/`, or a
+ * launcher's per-profile memory such as `<plugin>/profiles/<p>/memory/<project>/`).
+ * Whatever else guards those files (another plugin's own rules) still runs after this.
+ */
+export function isMemoryPath(path: string, home: string): boolean {
+  const full = canonical(path)
+  const base = canonical(home)
+  if (base === '' || full.split('/').includes('..') || !full.startsWith(`${base}/.claude/`)) {
+    return false
+  }
+  return full.slice(base.length + '/.claude/'.length).split('/').slice(0, -1).includes('memory')
+}
+
+/**
+ * For a CLAUDE.md in a folder below `<home>/.claude/` (never `~/.claude/CLAUDE.md`
+ * itself), the `memory` folder beside it. When that folder is there, the CLAUDE.md
+ * belongs to a profile with its own memory (the commander may Edit it; the
+ * profile's own plugin still guards which part); otherwise null.
+ */
+export function memoryBesideClaudeMd(path: string, home: string): string | null {
+  const full = canonical(path)
+  const base = canonical(home)
+  if (base === '' || full.split('/').includes('..') || !full.startsWith(`${base}/.claude/`)) {
+    return null
+  }
+  const rest = full.slice(base.length + '/.claude/'.length).split('/')
+  if (rest.length < 2 || rest[rest.length - 1] !== 'claude.md') {
+    return null
+  }
+  return `${base}/.claude/${[...rest.slice(0, -1), 'memory'].join('/')}`
+}
+
 // Snapshot → rows ----------------------------------------------------------------
 
 export type RawAgent = {
@@ -524,7 +558,7 @@ export const SPAWN_ROLES: readonly Role[] = ['plain', 'commander']
 
 export const ROLE_TEXT = [
   'herdr-commander: you are the COMMANDER of this herdr workspace.',
-  '- You observe and coordinate the other coding agents in herdr; you do not edit files yourself (Write/Edit/NotebookEdit are blocked while this role is on; /commander off ends it).',
+  '- You observe and coordinate the other coding agents in herdr; you do not edit files yourself (Write/Edit/NotebookEdit are blocked while this role is on; /commander off ends it). Memory is the exception: you keep your own memory up to date (files in a `memory` folder under ~/.claude/, such as your profile\'s project memory, and with Edit the memory section of a CLAUDE.md that has a `memory` folder beside it, such as your profile\'s cross-project memory).',
   '- ListAgents shows who is doing what (your herdr workers with their output files, and every other herdr pane with a screen file); Read those files to see their output.',
   '- Start a worker in this folder with the Agent tool, subagent_type herdr-commander:claude-worker or herdr-commander:codex-worker; for another folder use herdr_worker_spawn. Give or answer work with SendMessage; TaskStop ends a worker and closes its pane.',
   '- You are told once when a worker finishes (a Claude worker\'s final reply comes as a cross-session message from it; a Codex worker\'s notice names the result file to Read), when it sends you a message along the way, and when it stops without handing in a result. Check what it handed in before treating the work as done; idle status alone is never proof.',

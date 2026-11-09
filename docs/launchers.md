@@ -155,6 +155,7 @@ worker 開在 commander 自己的資料夾，其他行為跟 `herdr-commander:cl
 - **profile 不能關掉 herdr-commander。** 關掉的話，worker 起得來，但永遠不會回報 session，任務也送不進去（見第 5 節）。具體來說：
   - `plugins.off` 不要列 herdr-commander；
   - 用 `mcp.only` 時，要把 herdr-commander 列進去，否則它註冊的工具（例如 `herdr_worker_spawn`）會被擋。這條對 commander 自己的 session 也適用。
+- **commander 也可以用同一個 profile 開，而且能自己更新記憶。** commander 角色擋掉 Write／Edit，但 `~/.claude/` 底下 `memory` 資料夾裡的檔案例外，所以 profile 的專案記憶（`profiles/<p>/memory/<project-key>/`）commander 可以直接寫。旁邊有 `memory/` 資料夾的 CLAUDE.md 也可以用 Edit 改，也就是 profile 的 CLAUDE.md；能改哪一段由 SkillPool 的 mod 決定，只有「## 跨專案記憶」那段能改，規則區和記憶索引一樣擋。commander 代表你、commander 和 worker 三方的共識，所以記憶由 commander 寫，不交給 worker。
 - **worker 裡不要中途 `/skillpool <profile>`。** 一律在開 worker 時就帶 profile。中途切換會先跳「加入資料夾」的確認框，pane 會卡在 blocked 等人回答；接著還會壓縮對話。
 - **後面接的參數會蓋過 profile 的設定**：Agent 給的 `model`（`--model`）會蓋過 profile.json 的 model；`--name` 也一樣。
 - **兩種派工方式**：
